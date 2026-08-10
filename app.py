@@ -303,7 +303,7 @@ def create_contact():
         }), 201
 
 
-    except e as error:
+    except Exception as error:
 
         print("====================================")
         print("CONTACT API ERROR:")
