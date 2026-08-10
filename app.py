@@ -371,16 +371,11 @@ def create_contact():
 
     except Exception as error:
 
-        print("====================================")
-        print("CONTACT API ERROR:")
-        print(repr(error))
-        print("====================================")
-
+        print("API error:", error)
 
         return jsonify({
             "success": False,
-            "message": "Unable to submit your enquiry",
-            "error": str(error)
+            "message": "Unable to submit your enquiry"
         }), 500
 
 if __name__ == "__main__":
