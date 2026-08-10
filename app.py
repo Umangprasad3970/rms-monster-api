@@ -305,16 +305,16 @@ def create_contact():
 
     except e as error:
 
-    print("====================================")
-    print("CONTACT API ERROR:")
-    print(repr(error))
-    print("====================================")
-
-    return jsonify({
-        "success": False,
-        "message": "Unable to submit your enquiry",
-        "error": str(error)
-    }), 500
+        print("====================================")
+        print("CONTACT API ERROR:")
+        print(repr(error))
+        print("====================================")
+    
+        return jsonify({
+            "success": False,
+            "message": "Unable to submit your enquiry",
+            "error": str(error)
+        }), 500
 
 
 if __name__ == "__main__":
