@@ -96,30 +96,60 @@ def health():
 
 
 @app.route("/api/contact", methods=["POST"])
+@app.route("/api/contact", methods=["POST"])
 def create_contact():
 
     try:
 
-        data = request.get_json()
+        # --------------------------------------------------
+        # Read JSON request safely
+        # --------------------------------------------------
 
-        if not data:
+        data = request.get_json(silent=True)
 
-            return jsonify({
-                "success": False,
-                "message": "Request body is required"
-            }), 400
+        # If JSON was not received, try form data
+        if data is None:
+
+            if request.form:
+                data = request.form.to_dict()
+
+            else:
+
+                return jsonify({
+                    "success": False,
+                    "message": "Invalid request. JSON data is required."
+                }), 400
 
 
-        name = str(data.get("name", "")).strip()
+        # --------------------------------------------------
+        # Get form values
+        # --------------------------------------------------
 
-        email = str(data.get("email", "")).strip()
+        name = str(
+            data.get("name", data.get("fullName", ""))
+        ).strip()
 
-        phone = str(data.get("phone", "")).strip()
+        email = str(
+            data.get("email", "")
+        ).strip()
 
-        company = str(data.get("company", "")).strip()
+        phone = str(
+            data.get("phone", "")
+        ).strip()
+
+        company = str(
+            data.get("company", "")
+        ).strip()
 
         project_type = str(
-            data.get("project_type", "")
+            data.get(
+                "project_type",
+                data.get("projectType", "")
+            )
+        ).strip()
+
+        location = str(
+            data.get("location", "")
         ).strip()
 
         message = str(
@@ -127,9 +157,9 @@ def create_contact():
         ).strip()
 
 
-        # -------------------------
-        # Required fields
-        # -------------------------
+        # --------------------------------------------------
+        # Required field validation
+        # --------------------------------------------------
 
         if not name:
 
@@ -176,9 +206,9 @@ def create_contact():
             }), 400
 
 
-        # -------------------------
+        # --------------------------------------------------
         # Length validation
-        # -------------------------
+        # --------------------------------------------------
 
         if len(name) > 100:
 
@@ -216,6 +246,24 @@ def create_contact():
             }), 400
 
 
+        if len(project_type) > 50:
+
+            return jsonify({
+                "success": False,
+                "field": "project_type",
+                "message": "Project type cannot exceed 50 characters"
+            }), 400
+
+
+        if len(location) > 200:
+
+            return jsonify({
+                "success": False,
+                "field": "location",
+                "message": "Location cannot exceed 200 characters"
+            }), 400
+
+
         if len(message) > 2000:
 
             return jsonify({
@@ -225,11 +273,13 @@ def create_contact():
             }), 400
 
 
-        # -------------------------
-        # Format validation
-        # -------------------------
+        # --------------------------------------------------
+        # Email validation
+        # --------------------------------------------------
 
-        if not validate_email(email):
+        email_pattern = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
+
+        if not re.match(email_pattern, email):
 
             return jsonify({
                 "success": False,
@@ -238,7 +288,13 @@ def create_contact():
             }), 400
 
 
-        if not validate_phone(phone):
+        # --------------------------------------------------
+        # Phone validation
+        # --------------------------------------------------
+
+        phone_pattern = r"^\+?[0-9]{7,15}$"
+
+        if not re.match(phone_pattern, phone):
 
             return jsonify({
                 "success": False,
@@ -247,14 +303,18 @@ def create_contact():
             }), 400
 
 
-        # -------------------------
-        # Insert into database
-        # -------------------------
+        # --------------------------------------------------
+        # Database connection
+        # --------------------------------------------------
 
         connection = get_db_connection()
 
         cursor = connection.cursor()
 
+
+        # --------------------------------------------------
+        # Insert contact
+        # --------------------------------------------------
 
         query = """
             INSERT INTO contacts
@@ -264,9 +324,10 @@ def create_contact():
                 phone,
                 company,
                 project_type,
+                location,
                 message
             )
-            VALUES (%s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id, created_at
         """
 
@@ -279,6 +340,7 @@ def create_contact():
                 phone,
                 company,
                 project_type,
+                location,
                 message
             )
         )
@@ -295,6 +357,10 @@ def create_contact():
         connection.close()
 
 
+        # --------------------------------------------------
+        # Success response
+        # --------------------------------------------------
+
         return jsonify({
             "success": True,
             "message": "Your enquiry has been submitted successfully",
@@ -309,13 +375,13 @@ def create_contact():
         print("CONTACT API ERROR:")
         print(repr(error))
         print("====================================")
-    
+
+
         return jsonify({
             "success": False,
             "message": "Unable to submit your enquiry",
             "error": str(error)
         }), 500
-
 
 if __name__ == "__main__":
 
