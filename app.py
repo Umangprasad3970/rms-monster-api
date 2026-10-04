@@ -81,36 +81,54 @@ class DatabaseManager:
     def _get_mysql_connection(self, timeout=10):
         import pymysql
         import pymysql.cursors
+        import ssl
 
-        if MYSQL_URL:
-            # Parse mysql://user:pass@host:port/db
-            pattern = re.compile(r"mysql(?:\+pymysql)?://(?:(?P<user>[^:]+)(?::(?P<pass>[^@]*))?@)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?:/(?P<db>.*))?")
-            m = pattern.match(MYSQL_URL)
+        host = MYSQL_HOST or "localhost"
+        port = MYSQL_PORT
+        user = MYSQL_USER or "root"
+        password = MYSQL_PASSWORD
+        database = MYSQL_DATABASE
+        use_ssl = False
+
+        conn_str = MYSQL_URL or (DATABASE_URL if DATABASE_URL and "mysql" in DATABASE_URL.lower() else None)
+        if conn_str:
+            # Parse mysql://user:pass@host:port/db?query
+            pattern = re.compile(r"mysql(?:\+pymysql)?://(?:(?P<user>[^:]+)(?::(?P<pass>[^@]*))?@)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?:/(?P<db>[^?]*))?(?:\?(?P<query>.*))?")
+            m = pattern.match(conn_str)
             if m:
                 gd = m.groupdict()
-                return pymysql.connect(
-                    host=gd.get("host") or "localhost",
-                    port=int(gd.get("port") or 3306),
-                    user=gd.get("user") or "root",
-                    password=gd.get("pass") or "",
-                    database=gd.get("db") or MYSQL_DATABASE,
-                    charset="utf8mb4",
-                    cursorclass=pymysql.cursors.DictCursor,
-                    connect_timeout=timeout,
-                    autocommit=True
-                )
+                host = gd.get("host") or host
+                port = int(gd.get("port") or port)
+                user = gd.get("user") or user
+                password = gd.get("pass") or password
+                if gd.get("db"):
+                    database = gd.get("db")
+                query = gd.get("query") or ""
+                if "ssl" in query.lower():
+                    use_ssl = True
 
-        return pymysql.connect(
-            host=MYSQL_HOST or "localhost",
-            port=MYSQL_PORT,
-            user=MYSQL_USER or "root",
-            password=MYSQL_PASSWORD,
-            database=MYSQL_DATABASE,
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=timeout,
-            autocommit=True
-        )
+        if "aivencloud.com" in host or os.environ.get("MYSQL_SSL", "").lower() in ("true", "1", "required"):
+            use_ssl = True
+
+        connect_kwargs = {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "database": database,
+            "charset": "utf8mb4",
+            "cursorclass": pymysql.cursors.DictCursor,
+            "connect_timeout": timeout,
+            "autocommit": True
+        }
+
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            connect_kwargs["ssl"] = ctx
+
+        return pymysql.connect(**connect_kwargs)
 
     def get_connection(self):
         if self.mode == "mysql":
