@@ -1,99 +1,156 @@
-# Neoserve Projects — Enterprise REST API (v1.2.0)
+# Neoserve Projects — Enterprise REST API (v2.1.0)
 
-Production-grade Flask REST API for Neoserve Projects clean energy infrastructure (Solar, Wind, Hybrid, PEB, EV Charging, Green Hydrogen).
+Production-grade Flask REST API for Neoserve Projects clean energy infrastructure (Utility & Rooftop Solar, Wind Turbines, PEB Structures, Multi-Gun EV Charging Hubs, and Green Hydrogen Auxiliary Systems).
 
-Built according to the Neoserve API Architecture and Application Change Blueprint.
-
----
-
-## Features
-- **Base Version:** `/api/v1` with standard RFC 9457 Problem Details error formatting.
-- **Request Tracing:** Automatic `X-Request-Id` correlation tracking header on all requests.
-- **Idempotency Protection:** Prevents duplicate submissions from network timeouts or client retries via `Idempotency-Key` headers.
-- **Resilient Database Layer:** Seamlessly connects to PostgreSQL in production (`DATABASE_URL`) with automatic graceful fallback to local SQLite (`neoserve.db`) during development or connection disruptions. Auto-initializes schemas and seeds default portfolio data.
-- **CORS Enabled:** Full cross-origin support for web frontends and mobile clients (including Android Emulator `10.0.2.2`).
+Built according to the **Neoserve API Architecture Blueprint** and grounded directly in the **Official Project Brochure (`Neoderve Projects-BF1.pdf`)**.
 
 ---
 
-## API Endpoints Catalog
+## Key Features
+- **Unified Engine for Web & Android App:** Shared endpoints that parse both `application/json` and `application/x-www-form-urlencoded`.
+- **Database Engine with Resilient Triple-Fallback:**
+  1. **MySQL Native:** High-performance queries via PyMySQL with auto-reconnect and schema migrations.
+  2. **PostgreSQL Compatible:** Direct connection support via `DATABASE_URL` (e.g. Supabase, Render Postgres, AWS RDS).
+  3. **Local SQLite Fallback:** Seamless local failover (`neoserve.db`) if cloud DB is temporarily offline, ensuring 100% uptime.
+- **Asynchronous SMTP Email Notifications:** Automatic background dispatch of:
+  - Executive lead alerts to Neoserve team (`info@neoservepro.com`).
+  - Branded client acknowledgement emails with 24-hr review SLA.
+- **Official Brochure Integration:**
+  - Company leadership: Dinesh Ahirwar (`+91 63756 96762`, `info@neoservepro.com`).
+  - Direct brochure PDF download endpoint (`/api/v1/brochure/download`).
+- **Standardized RFC 9457 Problem Details:** Detailed error reporting with correlation request IDs (`X-Request-Id`).
+- **Idempotency Protection:** Prevents duplicate lead creation on network retries via `Idempotency-Key` headers.
 
-### 1. Health & Configuration
-- `GET /api/v1/health` (Legacy: `GET /api/health`): Service status, DB engine mode, uptime timestamp.
-- `GET /api/v1/ready`: Dependency health probe.
-- `GET /api/v1/public/config`: Safe frontend / mobile app configuration and supported service types.
+---
 
-### 2. Services Catalog
-- `GET /api/v1/services`: List of EPC service lines (Solar, Wind, Hybrid, PEB, EV Charging).
-- `GET /api/v1/services/<service_id>`: Individual service details with deliverables and capacity ranges.
+## 🚀 How to Host on Render Using GitHub (Step-by-Step)
 
-### 3. Leads & CRM Workflow
-- `POST /api/v1/leads`: Capture new business enquiry with `Idempotency-Key` support, validation, SLA review task creation, and activity logging.
+### Step 1: Open Render Dashboard
+1. Go to [https://dashboard.render.com](https://dashboard.render.com) and log in (or sign up with your GitHub account).
+2. Click the **New +** button in the top right and select **Web Service**.
+
+### Step 2: Connect GitHub Repository
+1. Choose **Build and deploy from a Git repository**.
+2. Select your repository: `Umangprasad3970/Neoserve-API` (or search for it if connecting for the first time).
+3. Click **Connect**.
+
+### Step 3: Configure Service Details
+Fill in the following fields on the Render configuration page:
+- **Name:** `neoserve-api` (or your preferred name, e.g., `rms-monster-api`)
+- **Region:** `Oregon (US West)` or `Singapore (Southeast Asia)`
+- **Branch:** `main`
+- **Root Directory:** Leave blank (or `.` if deploying from root of repository)
+- **Runtime:** `Python 3`
+- **Build Command:**
+  ```bash
+  pip install --upgrade pip && pip install -r requirements.txt
+  ```
+- **Start Command:**
+  ```bash
+  gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+  ```
+- **Instance Type:** `Free`
+
+### Step 4: Add Environment Variables
+Under the **Environment Variables** section on Render, add the following key-value pairs:
+
+| Key | Example Value | Description |
+|---|---|---|
+| `FLASK_ENV` | `production` | Production mode |
+| `PYTHON_VERSION` | `3.11.9` | Python runtime version |
+| `MYSQL_HOST` | `your-mysql-host.com` | MySQL server host (Optional if using Cloud MySQL) |
+| `MYSQL_PORT` | `3306` | MySQL port |
+| `MYSQL_USER` | `neoserve_user` | MySQL username |
+| `MYSQL_PASSWORD` | `your_mysql_password` | MySQL password |
+| `MYSQL_DATABASE` | `neoserve_db` | MySQL database name |
+| `SMTP_HOST` | `smtp.gmail.com` | SMTP host (e.g. Gmail, Zoho, SendGrid) |
+| `SMTP_PORT` | `587` | SMTP port (587 TLS or 465 SSL) |
+| `SMTP_USER` | `info@neoservepro.com` | Email account username |
+| `SMTP_PASSWORD` | `your_app_password` | Email / Google App password |
+| `SMTP_FROM_EMAIL` | `info@neoservepro.com` | Sender email address |
+| `NOTIFICATION_EMAIL_TO` | `info@neoservepro.com` | Recipient for new lead notifications |
+
+*(Note: If you don't configure MySQL or SMTP initially, the API will still run with local SQLite and simulated mail logs!)*
+
+### Step 5: Set Health Check Path
+Click **Advanced** at the bottom:
+- **Health Check Path:** `/api/v1/health`
+- **Auto-Deploy:** `Yes` (Render will automatically re-deploy every time you push to the `main` branch on GitHub!)
+
+### Step 6: Click "Create Web Service"
+Render will now clone the repo, install dependencies, and launch Gunicorn. Within ~2 minutes, your live URL will be active:
+```
+https://neoserve-api.onrender.com
+```
+
+---
+
+## 📡 Core API Endpoints
+
+### 1. Health & Company Identity
+- `GET /api/v1/health` (Legacy: `GET /api/health`): Service status, DB engine, uptime timestamp.
+- `GET /api/v1/company/overview`: Mission, national 500 GW target, Dinesh Ahirwar leadership info.
+- `GET /api/v1/company/stats`: High-level stats (455 MW managed, 890.5 GWh generation, 820k tons CO2 offset).
+- `GET /api/v1/brochure/info`: Brochure metadata, page count, and download link.
+- `GET /api/v1/brochure/download`: Direct download of official 6.58 MB PDF brochure.
+
+### 2. Core EPC Services (from Brochure)
+- `GET /api/v1/services`: List of all 5 core EPC service lines (Wind, Solar, PEB, EV Charging, Hybrid BESS).
+- `GET /api/v1/services/<id_or_slug>`: Deep technical steps and engineering components for a service.
+
+### 3. Clean Energy Projects Portfolio
+- `GET /api/v1/projects`: Filter projects by category (`Solar`, `Wind`, `Hybrid`, `PEB`, `EV Charging`) or search query.
+- `GET /api/v1/projects/<id>`: Full project specifications, client details, and KPIs.
+
+### 4. CRM Leads & Contact Forms (Android App & Website)
+- `POST /api/v1/leads`: Primary lead capture endpoint with `Idempotency-Key` duplicate prevention, 24-hr SLA task generation, and dual email notification.
 - `POST /api/contact`: Backwards-compatible legacy contact submission endpoint.
-- `POST /api/v1/leads/check-duplicate`: Verify whether an active lead already exists for email/phone.
-- `GET /api/v1/leads`: Paginated, searchable lead list with status filtering.
-- `GET /api/v1/leads/<id>`: Detailed lead information with complete activity timeline and tasks.
-- `PATCH /api/v1/leads/<id>/status`: Lifecycle stage transition (`NEW`, `QUALIFYING`, `QUALIFIED`, `SITE_VISIT_PENDING`, `PROPOSAL_REQUIRED`, `PROPOSAL_SENT`, `NEGOTIATION`, `WON`, `LOST`, `ON_HOLD`, `SPAM`).
-- `GET /api/v1/leads/<id>/activities` & `POST /api/v1/leads/<id>/activities`: Log calls, notes, site visits, or WhatsApp interactions.
+- `POST /api/v1/leads/check-duplicate`: Verify if an enquiry already exists for an email or phone number.
+- `GET /api/v1/leads`: Admin list of leads with status/service filtering.
+- `GET /api/v1/leads/<id>`: Complete lead details, activity timeline, and tasks.
+- `PATCH /api/v1/leads/<id>`: Update lead status (`NEW`, `CONTACTED`, `QUALIFIED`, `SITE_AUDIT`, `PROPOSAL_SENT`, `WON`, `LOST`).
+- `POST /api/v1/leads/<id>/activities`: Log CRM activities (calls, audits, notes).
 
-### 4. Tasks & Follow-ups
-- `GET /api/v1/tasks`: Task queue with status and priority filtering.
-- `POST /api/v1/tasks`: Create new follow-up task.
-- `PATCH /api/v1/tasks/<id>`: Mark task as completed or reschedule.
-
-### 5. Project Portfolio
-- `GET /api/v1/projects` (Legacy: `GET /api/projects`): Filterable projects portfolio (`category`, `query`).
-- `GET /api/v1/projects/<id>`: Project details and deliverables.
+### 5. SLA Follow-up Tasks Queue
+- `GET /api/v1/tasks`: SLA task queue with status filtering.
+- `POST /api/v1/tasks/<id>/complete`: Mark task complete.
 
 ### 6. Energy Yield & ROI Feasibility Calculator
-- `POST /api/v1/calculator/estimate` (Legacy: `POST /api/calculator/estimate`): Calculate recommended kW capacity, annual generation (kWh), estimated cost (Lakhs INR), annual savings, payback period, and CO2 offset.
+- `POST /api/v1/calculator/yield-roi`: Generates recommended kW capacity, annual kWh generation, cost in Lakhs, annual savings in INR, payback period in years, and CO2 offset.
 
 ### 7. Live O&M Telemetry
-- `GET /api/v1/telemetry/overview` (Legacy: `GET /api/telemetry/overview`): Live monitoring of active plants, capacity (MW), generation (MWh), and performance ratio (PR %).
+- `GET /api/v1/telemetry/overview`: Real-time active plant performance, MW output, PR ratio, and weather conditions.
 
-### 8. Site Consultation & RFQ
-- `POST /api/v1/consultation/schedule`: Schedule engineering consultation or site audit.
-- `POST /api/v1/quotes` (Legacy: `POST /api/rfq`): Commercial Request for Quotation.
-- `GET /api/v1/quotes/<id>`: Quote details.
-- `POST /api/v1/quotes/<id>/accept`: Customer acceptance of proposal.
-
-### 9. Authentication
-- `POST /api/v1/auth/login`: Staff login returning Bearer token.
-- `GET /api/v1/auth/me`: Validate identity and permissions.
+### 8. Engineering Site Audits & RFQ Quotes
+- `POST /api/v1/consultation/schedule`: Book a technical site survey / engineering audit.
+- `POST /api/v1/quotes`: Generate instant commercial RFQ proposal with detailed cost breakdown.
+- `GET /api/v1/quotes/<id>`: Retrieve quotation details.
+- `POST /api/v1/quotes/<id>/accept`: Client acceptance of quotation.
 
 ---
 
-## Local Setup & Run
+## 💻 Local Development Setup
 
-1. **Activate virtual environment:**
-   ```bash
-   # Windows
-   .\venv\Scripts\activate
-   # Linux/macOS
-   source venv/bin/activate
-   ```
+```bash
+# 1. Clone repository
+git clone https://github.com/Umangprasad3970/Neoserve-API.git
+cd Neoserve-API
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+# 2. Create and activate virtual environment
+python -m venv venv
+.\venv\Scripts\activate       # Windows
+source venv/bin/activate      # Linux / macOS
 
-3. **Configure Environment (`.env` optional):**
-   ```env
-   PORT=5000
-   DATABASE_URL=postgresql://user:password@host:5432/dbname
-   ```
-   *(If `DATABASE_URL` is omitted or PostgreSQL is unreachable, SQLite will be automatically utilized).*
+# 3. Install dependencies
+pip install -r requirements.txt
 
-4. **Start the API server:**
-   ```bash
-   python app.py
-   ```
-   Or using Gunicorn:
-   ```bash
-   gunicorn app:app -b 0.0.0.0:5000
-   ```
+# 4. Copy configuration
+cp .env.example .env
 
----
+# 5. Run automated verification suite
+python test_api.py
 
-## Deployment
-Configured for deployment on Render, Heroku, Railway, or AWS EC2/ECS with Python 3.11+.
+# 6. Start server
+python app.py
+```
+Server runs at `http://127.0.0.1:5000` (or `http://10.0.2.2:5000` inside Android Emulator).
