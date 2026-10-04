@@ -3,8 +3,12 @@ import re
 import uuid
 import json
 import sqlite3
+import smtplib
 import datetime
-from flask import Flask, request, jsonify, g
+import threading
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from flask import Flask, request, jsonify, g, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -24,11 +28,19 @@ CORS(
     }
 )
 
+# Configuration
+MYSQL_HOST = os.environ.get("MYSQL_HOST")
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("MYSQL_USER")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "neoserve_db")
+MYSQL_URL = os.environ.get("MYSQL_URL")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 LOCAL_SQLITE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neoserve.db")
+BROCHURE_PDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "Neoserve_Projects_Brochure.pdf")
 
 # ---------------------------------------------------------------------------
-# Database Abstraction (PostgreSQL with automatic resilient SQLite fallback)
+# Database Abstraction (MySQL Native with PostgreSQL and Resilient SQLite Fallback)
 # ---------------------------------------------------------------------------
 class DatabaseManager:
     def __init__(self):
@@ -37,7 +49,21 @@ class DatabaseManager:
         self.init_schema()
 
     def _test_connection(self):
-        if DATABASE_URL:
+        # 1. Try MySQL Connection First if configured
+        if MYSQL_HOST or MYSQL_URL or (DATABASE_URL and "mysql" in DATABASE_URL.lower()):
+            try:
+                import pymysql
+                import pymysql.cursors
+                conn = self._get_mysql_connection(timeout=4)
+                conn.close()
+                self.mode = "mysql"
+                print(f"[DatabaseManager] Successfully connected to MySQL ({MYSQL_HOST or 'via URL'})")
+                return
+            except Exception as e:
+                print(f"[DatabaseManager] MySQL connection failed ({e}). Checking fallbacks...")
+
+        # 2. Try PostgreSQL if configured
+        if DATABASE_URL and ("postgres" in DATABASE_URL.lower()):
             try:
                 import psycopg2
                 conn = psycopg2.connect(DATABASE_URL, connect_timeout=4)
@@ -46,11 +72,54 @@ class DatabaseManager:
                 print(f"[DatabaseManager] Connected to PostgreSQL via DATABASE_URL")
                 return
             except Exception as e:
-                print(f"[DatabaseManager] PostgreSQL connection failed ({e}). Falling back to local SQLite ({LOCAL_SQLITE_PATH})")
+                print(f"[DatabaseManager] PostgreSQL connection failed ({e}).")
+
+        # 3. Resilient SQLite Mode
         self.mode = "sqlite"
-        print(f"[DatabaseManager] Operating in resilient SQLite mode: {LOCAL_SQLITE_PATH}")
+        print(f"[DatabaseManager] Operating in resilient local SQLite mode: {LOCAL_SQLITE_PATH}")
+
+    def _get_mysql_connection(self, timeout=10):
+        import pymysql
+        import pymysql.cursors
+
+        if MYSQL_URL:
+            # Parse mysql://user:pass@host:port/db
+            pattern = re.compile(r"mysql(?:\+pymysql)?://(?:(?P<user>[^:]+)(?::(?P<pass>[^@]*))?@)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?:/(?P<db>.*))?")
+            m = pattern.match(MYSQL_URL)
+            if m:
+                gd = m.groupdict()
+                return pymysql.connect(
+                    host=gd.get("host") or "localhost",
+                    port=int(gd.get("port") or 3306),
+                    user=gd.get("user") or "root",
+                    password=gd.get("pass") or "",
+                    database=gd.get("db") or MYSQL_DATABASE,
+                    charset="utf8mb4",
+                    cursorclass=pymysql.cursors.DictCursor,
+                    connect_timeout=timeout,
+                    autocommit=True
+                )
+
+        return pymysql.connect(
+            host=MYSQL_HOST or "localhost",
+            port=MYSQL_PORT,
+            user=MYSQL_USER or "root",
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=timeout,
+            autocommit=True
+        )
 
     def get_connection(self):
+        if self.mode == "mysql":
+            try:
+                return self._get_mysql_connection(), "%s"
+            except Exception as e:
+                print(f"[DatabaseManager] MySQL runtime error ({e}). Fallback to SQLite.")
+                self.mode = "sqlite"
+
         if self.mode == "postgres":
             try:
                 import psycopg2
@@ -59,6 +128,7 @@ class DatabaseManager:
             except Exception as e:
                 print(f"[DatabaseManager] Postgres runtime error ({e}). Fallback to SQLite.")
                 self.mode = "sqlite"
+
         conn = sqlite3.connect(LOCAL_SQLITE_PATH)
         conn.row_factory = sqlite3.Row
         return conn, "?"
@@ -70,7 +140,8 @@ class DatabaseManager:
         try:
             cursor.execute(adjusted_query, params)
             last_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
-            conn.commit()
+            if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
+                conn.commit()
             return last_id
         finally:
             cursor.close()
@@ -85,6 +156,8 @@ class DatabaseManager:
             row = cursor.fetchone()
             if row is None:
                 return None
+            if self.mode == "mysql":
+                return row
             if self.mode == "postgres":
                 col_names = [desc[0] for desc in cursor.description]
                 return dict(zip(col_names, row))
@@ -100,6 +173,8 @@ class DatabaseManager:
         try:
             cursor.execute(adjusted_query, params)
             rows = cursor.fetchall()
+            if self.mode == "mysql":
+                return rows
             if self.mode == "postgres":
                 col_names = [desc[0] for desc in cursor.description]
                 return [dict(zip(col_names, r)) for r in rows]
@@ -112,1051 +187,1619 @@ class DatabaseManager:
         conn, _ = self.get_connection()
         cursor = conn.cursor()
         try:
-            # Contacts table (for backward compatibility)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    email TEXT,
-                    phone TEXT,
-                    company TEXT,
-                    project_type TEXT,
-                    message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """ if self.mode == "sqlite" else """
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id SERIAL PRIMARY KEY,
-                    name VARCHAR(150),
-                    email VARCHAR(150),
-                    phone VARCHAR(50),
-                    company VARCHAR(150),
-                    project_type VARCHAR(100),
-                    message TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 1. Contacts Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) NOT NULL,
+                        company VARCHAR(150) DEFAULT NULL,
+                        project_type VARCHAR(100) DEFAULT NULL,
+                        message TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_contacts_email (email),
+                        INDEX idx_contacts_created_at (created_at DESC)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            elif self.mode == "postgres":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) NOT NULL,
+                        company VARCHAR(150),
+                        project_type VARCHAR(100),
+                        message TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        phone TEXT NOT NULL,
+                        company TEXT,
+                        project_type TEXT,
+                        message TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Leads table (Target Blueprint Section 10)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS leads (
-                    id TEXT PRIMARY KEY,
-                    full_name TEXT NOT NULL,
-                    email TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    company TEXT,
-                    service_id TEXT,
-                    project_type TEXT,
-                    location TEXT,
-                    capacity TEXT,
-                    timeline TEXT,
-                    budget_range TEXT,
-                    message TEXT,
-                    status TEXT DEFAULT 'NEW',
-                    score INTEGER DEFAULT 50,
-                    owner_id TEXT,
-                    source TEXT DEFAULT 'website',
-                    campaign TEXT,
-                    idempotency_key TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 2. Leads Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS leads (
+                        id VARCHAR(64) PRIMARY KEY,
+                        full_name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) NOT NULL,
+                        company VARCHAR(150) DEFAULT NULL,
+                        service_id VARCHAR(100) DEFAULT NULL,
+                        project_type VARCHAR(150) DEFAULT NULL,
+                        location VARCHAR(255) DEFAULT NULL,
+                        capacity VARCHAR(100) DEFAULT NULL,
+                        timeline VARCHAR(100) DEFAULT NULL,
+                        budget_range VARCHAR(100) DEFAULT NULL,
+                        message TEXT NOT NULL,
+                        status VARCHAR(50) DEFAULT 'NEW',
+                        score INT DEFAULT 50,
+                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        source VARCHAR(100) DEFAULT 'website',
+                        campaign VARCHAR(150) DEFAULT NULL,
+                        idempotency_key VARCHAR(150) DEFAULT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_leads_status (status),
+                        INDEX idx_leads_email (email),
+                        INDEX idx_leads_phone (phone),
+                        INDEX idx_leads_service (service_id),
+                        INDEX idx_leads_idempotency (idempotency_key),
+                        INDEX idx_leads_created_at (created_at DESC)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            elif self.mode == "postgres":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS leads (
+                        id TEXT PRIMARY KEY,
+                        full_name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) NOT NULL,
+                        company VARCHAR(150),
+                        service_id VARCHAR(100),
+                        project_type VARCHAR(150),
+                        location TEXT,
+                        capacity VARCHAR(100),
+                        timeline VARCHAR(100),
+                        budget_range VARCHAR(100),
+                        message TEXT NOT NULL,
+                        status VARCHAR(50) DEFAULT 'NEW',
+                        score INT DEFAULT 50,
+                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        source VARCHAR(100) DEFAULT 'website',
+                        campaign VARCHAR(150),
+                        idempotency_key VARCHAR(150),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS leads (
+                        id TEXT PRIMARY KEY,
+                        full_name TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        phone TEXT NOT NULL,
+                        company TEXT,
+                        service_id TEXT,
+                        project_type TEXT,
+                        location TEXT,
+                        capacity TEXT,
+                        timeline TEXT,
+                        budget_range TEXT,
+                        message TEXT NOT NULL,
+                        status TEXT DEFAULT 'NEW',
+                        score INTEGER DEFAULT 50,
+                        owner_id TEXT DEFAULT 'dinesh.ahirwar',
+                        source TEXT DEFAULT 'website',
+                        campaign TEXT,
+                        idempotency_key TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Lead activities (Blueprint Section 10)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS lead_activities (
-                    id TEXT PRIMARY KEY,
-                    lead_id TEXT NOT NULL,
-                    activity_type TEXT NOT NULL,
-                    subject TEXT NOT NULL,
-                    notes TEXT,
-                    outcome TEXT,
-                    created_by TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 3. Lead Activities
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS lead_activities (
+                        id VARCHAR(64) PRIMARY KEY,
+                        lead_id VARCHAR(64) NOT NULL,
+                        activity_type VARCHAR(50) NOT NULL,
+                        subject VARCHAR(255) NOT NULL,
+                        notes TEXT DEFAULT NULL,
+                        outcome VARCHAR(100) DEFAULT NULL,
+                        created_by VARCHAR(100) DEFAULT 'Dinesh Ahirwar',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_activities_lead (lead_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS lead_activities (
+                        id TEXT PRIMARY KEY,
+                        lead_id TEXT NOT NULL,
+                        activity_type TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        notes TEXT,
+                        outcome TEXT,
+                        created_by TEXT DEFAULT 'Dinesh Ahirwar',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Tasks (Blueprint Section 10)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    entity_type TEXT NOT NULL,
-                    entity_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    owner_id TEXT,
-                    due_at TEXT,
-                    priority TEXT DEFAULT 'MEDIUM',
-                    status TEXT DEFAULT 'PENDING',
-                    completed_at TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 4. Tasks Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id VARCHAR(64) PRIMARY KEY,
+                        entity_type VARCHAR(50) NOT NULL DEFAULT 'LEAD',
+                        entity_id VARCHAR(64) NOT NULL,
+                        title VARCHAR(255) NOT NULL,
+                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        due_at VARCHAR(100) DEFAULT NULL,
+                        priority VARCHAR(50) DEFAULT 'MEDIUM',
+                        status VARCHAR(50) DEFAULT 'PENDING',
+                        completed_at TIMESTAMP NULL DEFAULT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_tasks_status (status),
+                        INDEX idx_tasks_entity (entity_type, entity_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id TEXT PRIMARY KEY,
+                        entity_type TEXT NOT NULL DEFAULT 'LEAD',
+                        entity_id TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        owner_id TEXT DEFAULT 'dinesh.ahirwar',
+                        due_at TEXT,
+                        priority TEXT DEFAULT 'MEDIUM',
+                        status TEXT DEFAULT 'PENDING',
+                        completed_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Projects Portfolio (Blueprint Section 10)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    capacity TEXT,
-                    location TEXT,
-                    client_name TEXT,
-                    scope_of_work TEXT,
-                    completion_year TEXT,
-                    status TEXT DEFAULT 'Operational',
-                    description TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 5. Services Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS services (
+                        id VARCHAR(64) PRIMARY KEY,
+                        slug VARCHAR(100) NOT NULL UNIQUE,
+                        title VARCHAR(255) NOT NULL,
+                        category VARCHAR(100) NOT NULL,
+                        short_desc TEXT NOT NULL,
+                        full_desc TEXT NOT NULL,
+                        steps_json JSON DEFAULT NULL,
+                        components_json JSON DEFAULT NULL,
+                        icon VARCHAR(100) DEFAULT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS services (
+                        id TEXT PRIMARY KEY,
+                        slug TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        short_desc TEXT NOT NULL,
+                        full_desc TEXT NOT NULL,
+                        steps_json TEXT,
+                        components_json TEXT,
+                        icon TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Quotes & RFQs (Blueprint Section 10)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS quotes (
-                    id TEXT PRIMARY KEY,
-                    project_id TEXT,
-                    lead_id TEXT,
-                    client_name TEXT,
-                    service_type TEXT,
-                    capacity TEXT,
-                    subtotal REAL DEFAULT 0.0,
-                    tax REAL DEFAULT 0.0,
-                    total REAL DEFAULT 0.0,
-                    status TEXT DEFAULT 'DRAFT',
-                    valid_until TEXT,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 6. Projects Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id VARCHAR(64) PRIMARY KEY,
+                        title VARCHAR(255) NOT NULL,
+                        category VARCHAR(100) NOT NULL,
+                        capacity VARCHAR(100) DEFAULT NULL,
+                        location VARCHAR(200) DEFAULT NULL,
+                        client_name VARCHAR(200) DEFAULT NULL,
+                        scope_of_work TEXT DEFAULT NULL,
+                        completion_year VARCHAR(20) DEFAULT NULL,
+                        status VARCHAR(50) DEFAULT 'Operational',
+                        description TEXT DEFAULT NULL,
+                        metrics_json JSON DEFAULT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_projects_category (category)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        capacity TEXT,
+                        location TEXT,
+                        client_name TEXT,
+                        scope_of_work TEXT,
+                        completion_year TEXT,
+                        status TEXT DEFAULT 'Operational',
+                        description TEXT,
+                        metrics_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Consultation / Audit requests
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS consultations (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    organization TEXT,
-                    email TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    preferred_date TEXT,
-                    topic TEXT,
-                    status TEXT DEFAULT 'SCHEDULED',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 7. Quotes Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS quotes (
+                        id VARCHAR(64) PRIMARY KEY,
+                        quote_number VARCHAR(100) NOT NULL UNIQUE,
+                        customer_name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) DEFAULT NULL,
+                        company VARCHAR(150) DEFAULT NULL,
+                        project_type VARCHAR(100) DEFAULT NULL,
+                        capacity VARCHAR(100) DEFAULT NULL,
+                        estimated_amount_inr DECIMAL(15,2) DEFAULT 0.00,
+                        breakdown_json JSON DEFAULT NULL,
+                        validity_days INT DEFAULT 30,
+                        status VARCHAR(50) DEFAULT 'DRAFT',
+                        accepted_at TIMESTAMP NULL DEFAULT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS quotes (
+                        id TEXT PRIMARY KEY,
+                        quote_number TEXT NOT NULL UNIQUE,
+                        customer_name TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        phone TEXT,
+                        company TEXT,
+                        project_type TEXT,
+                        capacity TEXT,
+                        estimated_amount_inr REAL DEFAULT 0.0,
+                        breakdown_json TEXT,
+                        validity_days INTEGER DEFAULT 30,
+                        status TEXT DEFAULT 'DRAFT',
+                        accepted_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Idempotency cache table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS idempotency_keys (
-                    idempotency_key TEXT PRIMARY KEY,
-                    response_json TEXT NOT NULL,
-                    status_code INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # 8. Consultations Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS consultations (
+                        id VARCHAR(64) PRIMARY KEY,
+                        booking_reference VARCHAR(50) NOT NULL UNIQUE,
+                        full_name VARCHAR(150) NOT NULL,
+                        email VARCHAR(150) NOT NULL,
+                        phone VARCHAR(50) NOT NULL,
+                        organization VARCHAR(150) DEFAULT NULL,
+                        preferred_date VARCHAR(50) DEFAULT NULL,
+                        audit_topic VARCHAR(150) NOT NULL,
+                        site_location TEXT DEFAULT NULL,
+                        status VARCHAR(50) DEFAULT 'SCHEDULED',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS consultations (
+                        id TEXT PRIMARY KEY,
+                        booking_reference TEXT NOT NULL UNIQUE,
+                        full_name TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        phone TEXT NOT NULL,
+                        organization TEXT,
+                        preferred_date TEXT,
+                        audit_topic TEXT NOT NULL,
+                        site_location TEXT,
+                        status TEXT DEFAULT 'SCHEDULED',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            conn.commit()
-            print("[DatabaseManager] Database schema initialized successfully.")
+            # 9. Email Logs Table
+            if self.mode == "mysql":
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS email_logs (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        email_to VARCHAR(150) NOT NULL,
+                        email_type VARCHAR(50) NOT NULL,
+                        subject VARCHAR(255) NOT NULL,
+                        status VARCHAR(50) NOT NULL DEFAULT 'SENT',
+                        error_message TEXT DEFAULT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_email_logs_status (status)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS email_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        email_to TEXT NOT NULL,
+                        email_type TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        status TEXT DEFAULT 'SENT',
+                        error_message TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
 
-            # Seed default projects if empty
-            cursor.execute("SELECT COUNT(*) FROM projects")
-            row = cursor.fetchone()
-            count = row[0] if row else 0
-            if count == 0:
-                self._seed_default_projects(cursor, conn)
+            if hasattr(conn, "commit") and not getattr(conn, "autocommit", False):
+                conn.commit()
 
-        except Exception as e:
-            print(f"[DatabaseManager] Schema init error: {e}")
+            # Seed default projects & services from brochure if empty
+            self._seed_default_data()
+
         finally:
             cursor.close()
             conn.close()
 
-    def _seed_default_projects(self, cursor, conn):
-        seeds = [
-            ("p1", "25 MW Wind Turbine Generator Erection", "Wind", "25 MW", "Kutch, Gujarat", "Suzlon / Serentica Renewables", "Foundation, Tower Erection, Nacelle & Rotor Assembly, Grid Commissioning", "2024", "Operational", "Complete civil, mechanical erection, rotor blade hoisting and electrical testing for 2.1MW class wind turbines."),
-            ("p2", "50 MW Utility Solar Power Plant", "Solar", "50 MWp", "Bhadla, Rajasthan", "Tata Power Renewable Energy", "MMS Racking, Inverter Stations, Cabling, SCADA Sync", "2024", "Operational", "Turnkey mechanical mounting, high-efficiency bifacial panel installation, 33kV substation interconnections."),
-            ("p3", "Hybrid Wind-Solar Park (30MW Wind + 15MW Solar)", "Hybrid", "45 MW Total", "Tuticorin, Tamil Nadu", "Envision Energy / ReNew Power", "Hybrid Grid Sync, Wind Erection, Solar Array Wiring", "2023", "Operational", "Seamless co-located wind turbine and solar PV park execution with common pooling substation integration."),
-            ("p4", "120,000 Sq Ft Industrial PEB Facility", "PEB", "120,000 Sq Ft", "Pune, Maharashtra", "Industrial Energy Client", "Pre-Engineered Structural Steel Fabrication, Erection, Roofing", "2024", "Completed", "Heavy industrial PEB structure with solar-ready roof load capacity for clean energy manufacturing."),
-            ("p5", "Ultra-Fast Multi-Port EV Charging Hub", "EV Charging", "240 kW DC Fast Chargers", "Bengaluru - Chennai Highway", "Commercial Fleet Partner", "Transformer Setup, DC Fast Charger Commissioning, Network CMS", "2024", "Operational", "High-voltage DC fast charging infrastructure with dual CCS2 guns and dynamic load distribution."),
-            ("p6", "Green Hydrogen Auxiliary Power Plant Integration", "Hybrid", "10 MW", "Hazira, Gujarat", "Green Energy Consortium", "Captive Solar Power Feed, Power Conditioning, O&M", "2024", "Commissioning Phase", "Dedicated clean solar power plant installation to drive green hydrogen electrolyzer auxiliary loads.")
-        ]
-        placeholder = "%s" if self.mode == "postgres" else "?"
-        query = f"INSERT INTO projects (id, title, category, capacity, location, client_name, scope_of_work, completion_year, status, description) VALUES ({','.join([placeholder]*10)})"
-        for seed in seeds:
-            cursor.execute(query, seed)
-        conn.commit()
-        print(f"[DatabaseManager] Seeded {len(seeds)} default projects.")
+    def _seed_default_data(self):
+        # Check projects count
+        res = self.execute_read_one("SELECT COUNT(*) as cnt FROM projects")
+        cnt = res["cnt"] if res else 0
+        if cnt == 0:
+            print("[DatabaseManager] Seeding clean energy projects from brochure...")
+            projects = [
+                (
+                    "prj_kutch_wind_01",
+                    "Kutch Mega Wind Energy Park (Phase I & II)",
+                    "Wind",
+                    "120 MW",
+                    "Kutch Region, Gujarat",
+                    "Adani Green Energy Ltd",
+                    "Turnkey logistics, heavy foundation construction, crane hoisting of 60 WTG nacelles and 72m rotor blades, 33kV internal collection network, and commissioning.",
+                    "2024",
+                    "Operational",
+                    "Massive onshore wind park delivering clean wind power into the western regional grid with an average plant availability exceeding 98.7%."
+                ),
+                (
+                    "prj_bhadla_solar_02",
+                    "Bhadla Solar Power Mega Farm",
+                    "Solar",
+                    "250 MW",
+                    "Jodhpur District, Rajasthan",
+                    "NTPC Renewable Energy Ltd",
+                    "Turnkey ground-mounted bifacial solar PV erection, single-axis tracker alignment, central inverter stations, and 33/220kV pooling substation.",
+                    "2024",
+                    "Operational",
+                    "One of India's premier solar power installations generating high-yield solar energy under demanding desert conditions with automated robotic module cleaning systems."
+                ),
+                (
+                    "prj_charanka_hybrid_03",
+                    "Charanka Co-located Wind-Solar Hybrid Facility",
+                    "Hybrid",
+                    "75 MW Hybrid (45 MW Solar + 30 MW Wind)",
+                    "Patan, Gujarat",
+                    "Torrent Power Limited",
+                    "Co-located hybrid plant engineering, shared pooling switchyard, dual-source SCADA integration, and grid synchronization.",
+                    "2025",
+                    "Operational",
+                    "High-efficiency hybrid facility capturing complementary daytime solar peaks and night-time coastal wind streams for continuous grid dispatch."
+                ),
+                (
+                    "prj_sanand_peb_04",
+                    "Sanand Mega PEB Industrial Logistics Complex",
+                    "PEB",
+                    "180,000 Sq. Ft.",
+                    "Sanand Industrial Zone, Gujarat",
+                    "Tata Motors Supplier Industrial Park",
+                    "Full pre-engineered building structural design, factory fabrication, anchor bolt casting, heavy portal frame erection, and insulated sandwich roof sheeting.",
+                    "2023",
+                    "Operational",
+                    "Heavy-duty industrial warehouse with 12m clear height, 35m clear spans, seismic zone IV compliance, and natural daylighting skylights."
+                ),
+                (
+                    "prj_expressway_ev_05",
+                    "Delhi-Mumbai Expressway Multi-Gun EV Charging Hubs",
+                    "EV Charging",
+                    "24 Fast-Charging Guns (120 kW & 180 kW DC)",
+                    "Vadodara - Surat Highway Corridor",
+                    "National Highway Logistics Management (NHAI)",
+                    "Turnkey civil foundation, compact substation transformers, DC fast charger erection, OCPP 2.0 cloud billing integration, and 24/7 remote CMS.",
+                    "2024",
+                    "Operational",
+                    "Ultra-fast corridor EV hub capable of charging commercial buses, SUVs, and passenger electric vehicles in under 25 minutes."
+                ),
+                (
+                    "prj_dahej_hydrogen_06",
+                    "Dahej Green Hydrogen Auxiliary Solar & BESS Plant",
+                    "Hybrid",
+                    "10 MW Solar + 2 MW / 4 MWh BESS",
+                    "Dahej Chemical SEZ, Gujarat",
+                    "Gujarat Alkalies and Chemicals Ltd (GACL)",
+                    "Dedicated captive bifacial solar plant integrated with containerized LFP battery storage to provide uninterrupted green power to an industrial electrolyzer.",
+                    "2025",
+                    "Operational",
+                    "Groundbreaking clean-energy decarbonization pilot producing green hydrogen for chemical manufacturing with zero grid carbon intensity."
+                )
+            ]
+            for p in projects:
+                self.execute_write(
+                    "INSERT INTO projects (id, title, category, capacity, location, client_name, scope_of_work, completion_year, status, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    p
+                )
+
+        # Check services count
+        res_srv = self.execute_read_one("SELECT COUNT(*) as cnt FROM services")
+        cnt_srv = res_srv["cnt"] if res_srv else 0
+        if cnt_srv == 0:
+            print("[DatabaseManager] Seeding EPC services from brochure...")
+            services = [
+                (
+                    "srv_wind_01",
+                    "wind-power-projects",
+                    "Wind Power Project (Erection & Commissioning)",
+                    "Wind Energy",
+                    "Turnkey Wind Turbine Generator (WTG) installation, foundation, nacelle/rotor hoisting, and grid commissioning for onshore & offshore sites.",
+                    "Wind power projects harness the kinetic energy of the wind to generate electricity. Neoserve Projects specializes in navigating the challenging logistics of executing wind projects in rural and difficult terrain, heavy crane operations, and complete mechanical/electrical commissioning.",
+                    json.dumps([
+                        "Wind Resource Assessment & Micro-siting",
+                        "Site Selection, Logistics & Route Planning",
+                        "Heavy Civil Foundation Installation",
+                        "Tower Multi-Section Erection",
+                        "Nacelle & Powertrain Hoisting",
+                        "Rotor Hub & Giant Blade Installation",
+                        "Electrical BOS & Internal Cabling Integration",
+                        "Safety Interlock & SCADA Testing",
+                        "High-Voltage Substation Commissioning",
+                        "Grid Synchronization & Operational Handover"
+                    ]),
+                    json.dumps([
+                        "Wind Turbines (WTGs)",
+                        "Aerodynamic Rotor Blades (Up to 80m+)",
+                        "Tubular Steel / Hybrid Concrete Towers",
+                        "Drive Nacelles & Gearboxes",
+                        "Microprocessor Control Systems & Yaw Drives",
+                        "Step-Up Pooling Substation Transformers"
+                    ]),
+                    "wind"
+                ),
+                (
+                    "srv_solar_02",
+                    "solar-power-plants",
+                    "Solar Power Plant Projects (Utility, C&I, Rooftop)",
+                    "Solar Energy",
+                    "Utility-scale solar farms, commercial rooftop solar, and ground-mounted PV arrays supporting India's 500 GW 2030 green target.",
+                    "Neoserve delivers end-to-end solar solutions from site shadow analysis and net-metering regulatory clearance to high-efficiency PV module mounting, central inverter grid synchronization, and SCADA monitoring.",
+                    json.dumps([
+                        "Solar Resource & Shadow Analysis",
+                        "Regulatory Permitting & DISCOM Approvals",
+                        "Civil Pile Foundations & Ground Levelling",
+                        "Corrosion-Resistant Module Mounting Structures (MMS)",
+                        "High-Efficiency PV Module Stringing",
+                        "Inverter & HT Transformer Integration",
+                        "Grid Net-Metering & Synchronization",
+                        "Commissioning, PR Testing & SCADA Handover"
+                    ]),
+                    json.dumps([
+                        "Monocrystalline & Bifacial Solar PV Panels",
+                        "Single-Axis Trackers & Fixed MMS Structures",
+                        "Utility String & Central Inverters",
+                        "DC Combiner Boxes & HT Switchgear",
+                        "Net-Metering Bidirectional Import-Export Meters",
+                        "SCADA Remote Performance Weather Stations"
+                    ]),
+                    "solar"
+                ),
+                (
+                    "srv_peb_03",
+                    "peb-structural-construction",
+                    "Pre-Engineered Building (PEB) Constructions",
+                    "Structural Construction",
+                    "Fast-track, cost-effective structural steel buildings designed, fabricated, and hoisted for industrial plants, warehouses, and clean-tech hubs.",
+                    "Pre-engineered buildings (PEBs) offer exceptional speed of execution, cost control, structural durability, and architectural versatility. Neoserve provides precision factory fabrication, heavy crane assembly, and weather-sealed industrial sheds.",
+                    json.dumps([
+                        "Structural Design, Wind & Seismic Load Modeling",
+                        "High-Precision Factory Steel Fabrication",
+                        "Surface Shot-Blasting & Anti-Corrosive Coating",
+                        "Standardized Structural Component Logistics",
+                        "Anchor Bolt Casting & Foundation Setting",
+                        "Primary Rigid Frame Crane Erection",
+                        "Secondary Z/C Purlin & Girt Alignment",
+                        "Insulated Roof & Wall Sandwich Sheeting",
+                        "Ventilation Louvers & Ridge Vents Installation",
+                        "Final Structural Integrity & Quality Certification"
+                    ]),
+                    json.dumps([
+                        "Primary Built-up Heavy Steel Frames",
+                        "Cold-Formed Galvanized Z & C Purlins",
+                        "Insulated Polyurethane/Rockwool Sandwich Panels",
+                        "High-Tensile Anchor Bolts & Bracing Cables",
+                        "Self-Drilling Fasteners & EPDM Weather Gaskets",
+                        "Polycarbonate Skylight Daylighting Sheets"
+                    ]),
+                    "warehouse"
+                ),
+                (
+                    "srv_ev_04",
+                    "ev-charging-stations",
+                    "EV Charging Stations Installation & Commissioning",
+                    "EV Infrastructure",
+                    "High-power DC Fast-Charging hubs and commercial AC charging infrastructure with smart OCPP cloud networking and payment integration.",
+                    "Neoserve delivers turnkey EV charging plaza infrastructure for national highways, corporate campuses, fleet depots, and public parking complexes, ensuring grid reliability, high uptime, and seamless billing.",
+                    json.dumps([
+                        "Site Traffic & Accessibility Analysis",
+                        "Dedicated Electrical Substation & Transformer Sizing",
+                        "DISCOM EV Tariff Liaison & Regulatory Clearances",
+                        "Hardware Selection (AC Type-2 & DC CCS-2 Fast Guns)",
+                        "Civil Foundation, Cable Trenches & Conduit Laying",
+                        "Charger Mounting, Earthing & Ground Fault Testing",
+                        "OCPP 1.6J / 2.0.1 Cloud Management Integration",
+                        "Dynamic Load Balancing & Energy Meter Verification",
+                        "Payment Gateway & Driver Mobile App Testing",
+                        "Final Safety Commissioning & Operational Launch"
+                    ]),
+                    json.dumps([
+                        "DC Fast Chargers (60 kW to 240 kW Dual/Quad Guns)",
+                        "AC Commercial Destination Chargers (7.4 kW to 22 kW)",
+                        "Compact Dedicated Substation (CSS) Transformers",
+                        "Industrial 4G/LTE Cloud Gateways",
+                        "Surge Protection Devices (SPD) & Residual Current Breakers",
+                        "LED Illuminated Canopies & Digital Safety Signage"
+                    ]),
+                    "ev_station"
+                ),
+                (
+                    "srv_hybrid_05",
+                    "hybrid-energy-systems",
+                    "Hybrid Wind-Solar, BESS & Green Hydrogen Plants",
+                    "Future Energy & Storage",
+                    "Co-located Wind-Solar hybrid power generation, Battery Energy Storage Systems (BESS), and green hydrogen auxiliary installations.",
+                    "To guarantee round-the-clock (RTC) green power and accelerate industrial decarbonization, Neoserve designs and executes integrated hybrid power plants coupled with containerized lithium battery systems and green hydrogen electrolyzer auxiliaries.",
+                    json.dumps([
+                        "Wind-Solar Complementary Micro-Generation Simulation",
+                        "Battery Energy Storage System (BESS) Sizing & Chemistry Optimization",
+                        "Shared Evacuation Substation & Switchyard Engineering",
+                        "Electrolyzer Auxiliary Water Treatment & Gas Piping Planning",
+                        "High Voltage Pooling Grid Synchronization",
+                        "Dynamic Ramp-rate Frequency Regulation Testing",
+                        "Emergency Battery Black-Start & Safety System Commissioning"
+                    ]),
+                    json.dumps([
+                        "Utility-Scale Wind Turbines & Bifacial Solar PV",
+                        "Containerized Lithium-Iron-Phosphate (LFP) BESS Units",
+                        "Bi-directional Power Conversion System (PCS) Inverters",
+                        "Electrolyzer Auxiliary Balance of Plant (BOP) Skids",
+                        "High-Voltage 66kV/132kV Pooling Switchyards",
+                        "Advanced Energy Management System (EMS) Controllers"
+                    ]),
+                    "battery_charging_full"
+                )
+            ]
+            for s in services:
+                self.execute_write(
+                    "INSERT INTO services (id, slug, title, category, short_desc, full_desc, steps_json, components_json, icon) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    s
+                )
 
 db = DatabaseManager()
 
 # ---------------------------------------------------------------------------
-# Middleware: Request Correlation ID & RFC 9457 Errors
+# Asynchronous SMTP Email Notification System
 # ---------------------------------------------------------------------------
-@app.before_request
-def assign_request_id():
-    req_id = request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex[:12]}"
-    g.request_id = req_id
+class EmailService:
+    def __init__(self, db_manager):
+        self.db = db_manager
+        self.smtp_host = os.environ.get("SMTP_HOST", "")
+        self.smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        self.smtp_user = os.environ.get("SMTP_USER", "")
+        self.smtp_password = os.environ.get("SMTP_PASSWORD", "")
+        self.smtp_from = os.environ.get("SMTP_FROM_EMAIL", "info@neoservepro.com")
+        self.notification_to = os.environ.get("NOTIFICATION_EMAIL_TO", "info@neoservepro.com")
+        self.use_tls = os.environ.get("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes")
 
-@app.after_request
-def append_request_headers(response):
-    response.headers["X-Request-Id"] = getattr(g, "request_id", f"req_{uuid.uuid4().hex[:12]}")
-    return response
+    def is_configured(self):
+        return bool(self.smtp_host and self.smtp_user and self.smtp_password)
 
-def rfc9457_error(title, detail, status=400, errors=None, problem_type=None):
-    if problem_type is None:
-        type_mapping = {
-            400: "bad-request",
-            401: "unauthorized",
-            403: "forbidden",
-            404: "not-found",
-            409: "conflict",
-            422: "validation-error",
-            429: "rate-limit-exceeded",
-            500: "internal-server-error"
-        }
-        problem_type = f"https://api.neoservepro.com/problems/{type_mapping.get(status, 'error')}"
-    
+    def send_async(self, to_email, subject, html_content, email_type="LEAD_NOTIFICATION"):
+        thread = threading.Thread(
+            target=self._send_worker,
+            args=(to_email, subject, html_content, email_type),
+            daemon=True
+        )
+        thread.start()
+
+    def _send_worker(self, to_email, subject, html_content, email_type):
+        safe_subject = subject.encode("ascii", errors="replace").decode("ascii")
+        if not self.is_configured():
+            print(f"[EmailService] [SIMULATED] SMTP not configured. Subject: '{safe_subject}' -> Recipient: <{to_email}>")
+            try:
+                self.db.execute_write(
+                    "INSERT INTO email_logs (email_to, email_type, subject, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                    (to_email, email_type, subject, "SIMULATED", "SMTP credentials not configured in .env")
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = self.smtp_from
+            msg["To"] = to_email
+            msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+            if self.smtp_port == 465:
+                server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=12)
+            else:
+                server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=12)
+                if self.use_tls:
+                    server.starttls()
+
+            server.login(self.smtp_user, self.smtp_password)
+            server.send_message(msg)
+            server.quit()
+            print(f"[EmailService] Successfully dispatched email '{subject}' to <{to_email}>")
+            try:
+                self.db.execute_write(
+                    "INSERT INTO email_logs (email_to, email_type, subject, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                    (to_email, email_type, subject, "SENT", None)
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[EmailService] Email dispatch failed to <{to_email}>: {err_msg}")
+            try:
+                self.db.execute_write(
+                    "INSERT INTO email_logs (email_to, email_type, subject, status, error_message) VALUES (?, ?, ?, ?, ?)",
+                    (to_email, email_type, subject, "FAILED", err_msg)
+                )
+            except Exception:
+                pass
+
+    def send_lead_notifications(self, lead_data):
+        # 1. Admin Alert to Neoserve Team
+        admin_subject = f"[Neoserve Lead Alert] New Project: {lead_data.get('fullName')} - {lead_data.get('projectType') or 'Clean Energy'}"
+        admin_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }}
+                .container {{ max-width: 650px; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.08); margin: auto; }}
+                .header {{ background: linear-gradient(135deg, #0d5c3a 0%, #1e824c 100%); color: #ffffff; padding: 25px; text-align: center; }}
+                .header h1 {{ margin: 0; font-size: 24px; letter-spacing: 0.5px; }}
+                .header p {{ margin: 5px 0 0; opacity: 0.85; font-size: 14px; }}
+                .badge {{ display: inline-block; background: #f39c12; color: #fff; padding: 4px 12px; border-radius: 20px; font-weight: bold; font-size: 12px; margin-top: 10px; }}
+                .content {{ padding: 25px 30px; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+                th, td {{ padding: 12px 14px; text-align: left; border-bottom: 1px solid #edf2f7; font-size: 14px; }}
+                th {{ width: 35%; color: #718096; font-weight: 600; text-transform: uppercase; font-size: 12px; }}
+                td {{ color: #2d3748; font-weight: 500; }}
+                .message-box {{ background: #f8fafc; border-left: 4px solid #1e824c; padding: 15px; margin-top: 20px; border-radius: 4px; font-size: 14px; color: #334155; }}
+                .footer {{ background: #f1f5f9; padding: 15px; text-align: center; font-size: 12px; color: #64748b; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Neoserve Projects CRM</h1>
+                    <p>New Clean Energy Project Enquiry Captured</p>
+                    <span class="badge">SLA: Review within 24 Hours</span>
+                </div>
+                <div class="content">
+                    <table>
+                        <tr><th>Lead Reference</th><td><strong>{lead_data.get('id')}</strong></td></tr>
+                        <tr><th>Full Name</th><td>{lead_data.get('fullName')}</td></tr>
+                        <tr><th>Phone</th><td><a href="tel:{lead_data.get('phone')}">{lead_data.get('phone')}</a></td></tr>
+                        <tr><th>Email</th><td><a href="mailto:{lead_data.get('email')}">{lead_data.get('email')}</a></td></tr>
+                        <tr><th>Company</th><td>{lead_data.get('company') or 'Individual / Private'}</td></tr>
+                        <tr><th>Service Line</th><td>{lead_data.get('serviceId') or 'Renewable Energy'}</td></tr>
+                        <tr><th>Project Type</th><td>{lead_data.get('projectType') or 'Unspecified'}</td></tr>
+                        <tr><th>Target Capacity</th><td>{lead_data.get('capacity') or 'Not specified'}</td></tr>
+                        <tr><th>Budget Range</th><td>{lead_data.get('budgetRange') or 'Flexible'}</td></tr>
+                        <tr><th>Target Location</th><td>{lead_data.get('location') or 'Pan-India'}</td></tr>
+                        <tr><th>Timeline</th><td>{lead_data.get('timeline') or 'Immediate / 3-6 Months'}</td></tr>
+                        <tr><th>Source</th><td>{lead_data.get('source')}</td></tr>
+                    </table>
+                    <div class="message-box">
+                        <strong>Client Message / Scope:</strong><br/>
+                        {lead_data.get('message')}
+                    </div>
+                </div>
+                <div class="footer">
+                    Neoserve Projects &bull; Empowering Sustainable Growth &bull; Contact: Dinesh Ahirwar (+91 63756 96762)
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        self.send_async(self.notification_to, admin_subject, admin_html, "LEAD_ADMIN_ALERT")
+
+        # 2. Branded Acknowledgement to Client
+        client_email = lead_data.get("email")
+        if client_email and "@" in client_email:
+            client_subject = f"Thank you for contacting Neoserve Projects [Ref: {lead_data.get('id')}]"
+            client_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f7fafc; margin: 0; padding: 20px; }}
+                    .box {{ max-width: 600px; background: #ffffff; border-radius: 8px; overflow: hidden; margin: auto; border: 1px solid #e2e8f0; }}
+                    .header {{ background: #0d5c3a; color: #ffffff; padding: 25px; text-align: center; }}
+                    .content {{ padding: 25px; color: #2d3748; line-height: 1.6; font-size: 15px; }}
+                    .card {{ background: #edf7ed; border: 1px solid #c8e6c9; border-radius: 6px; padding: 15px; margin: 20px 0; }}
+                    .footer {{ background: #f8fafc; padding: 15px; text-align: center; font-size: 12px; color: #718096; }}
+                </style>
+            </head>
+            <body>
+                <div class="box">
+                    <div class="header">
+                        <h2 style="margin:0;">Neoserve Projects</h2>
+                        <p style="margin:5px 0 0; font-size:13px; opacity:0.9;">Empowering Sustainable Growth</p>
+                    </div>
+                    <div class="content">
+                        <p>Dear <strong>{lead_data.get('fullName')}</strong>,</p>
+                        <p>Thank you for submitting your clean energy requirement to <strong>Neoserve Projects</strong>. We have received your enquiry for <strong>{lead_data.get('projectType') or 'Renewable Energy Systems'}</strong>.</p>
+                        <div class="card">
+                            <p style="margin:0 0 5px 0;"><strong>Enquiry Reference:</strong> {lead_data.get('id')}</p>
+                            <p style="margin:0 0 5px 0;"><strong>Project Type:</strong> {lead_data.get('projectType')}</p>
+                            <p style="margin:0;"><strong>Review Status:</strong> Scheduled for Engineering Review (within 24 hours)</p>
+                        </div>
+                        <p>Our senior technical consultant led by <strong>Dinesh Ahirwar</strong> will review your location and capacity parameters and connect with you to discuss site feasibility, yield forecasts, and turnkey execution.</p>
+                        <p>For urgent engineering consultations or site surveys, reach out directly:</p>
+                        <p><strong>Phone:</strong> +91 63756 96762<br/><strong>Email:</strong> info@neoservepro.com<br/><strong>Website:</strong> www.neoservepro.com</p>
+                    </div>
+                    <div class="footer">
+                        Neoserve Projects &bull; Wind Power &bull; Solar Plants &bull; PEB Structures &bull; EV Fast Charging
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            self.send_async(client_email, client_subject, client_html, "LEAD_CLIENT_RECEIPT")
+
+    def send_consultation_alert(self, data):
+        subject = f"[Neoserve Site Audit] Technical Site Audit Scheduled: {data.get('full_name')} - {data.get('audit_topic')}"
+        html = f"""
+        <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto; padding:20px; border:1px solid #ddd; border-radius:8px;">
+            <h2 style="color:#0d5c3a; margin-top:0;">Neoserve Technical Site Audit Booking</h2>
+            <p>A new technical site consultation has been scheduled:</p>
+            <ul>
+                <li><strong>Booking Ref:</strong> {data.get('booking_reference')}</li>
+                <li><strong>Client:</strong> {data.get('full_name')} ({data.get('organization') or 'Private'})</li>
+                <li><strong>Phone:</strong> {data.get('phone')}</li>
+                <li><strong>Email:</strong> {data.get('email')}</li>
+                <li><strong>Topic:</strong> {data.get('audit_topic')}</li>
+                <li><strong>Preferred Date:</strong> {data.get('preferred_date')}</li>
+                <li><strong>Site Location:</strong> {data.get('site_location')}</li>
+            </ul>
+        </div>
+        """
+        self.send_async(self.notification_to, subject, html, "AUDIT_ADMIN_ALERT")
+
+email_service = EmailService(db)
+
+# ---------------------------------------------------------------------------
+# Request Utilities & RFC 9457 Problem Details
+# ---------------------------------------------------------------------------
+def get_request_data():
+    """Seamlessly extracts payload from JSON or standard URL-encoded web forms."""
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    if request.form:
+        return request.form.to_dict()
+    # Try parsing raw data as JSON fallback
+    try:
+        return json.loads(request.get_data(as_text=True))
+    except Exception:
+        return {}
+
+def rfc9457_error(title, status_code, detail, error_type=None, invalid_params=None):
     payload = {
-        "type": problem_type,
+        "type": error_type or f"https://api.neoservepro.com/errors/http-{status_code}",
         "title": title,
-        "status": status,
+        "status": status_code,
         "detail": detail,
         "instance": request.path,
-        "requestId": getattr(g, "request_id", "req_unknown"),
-        "success": False
+        "correlationId": getattr(g, "request_id", str(uuid.uuid4()))
     }
-    if errors:
-        payload["errors"] = errors
-    return jsonify(payload), status
+    if invalid_params:
+        payload["errors"] = invalid_params
+    return jsonify(payload), status_code
+
+@app.before_request
+def handle_before_request():
+    g.request_id = request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex[:12]}"
+    if request.method == "OPTIONS":
+        return jsonify({"status": "OK"}), 200
+
+@app.after_request
+def handle_after_request(response):
+    response.headers["X-Request-Id"] = getattr(g, "request_id", "")
+    return response
 
 # ---------------------------------------------------------------------------
-# Validation Helpers
+# 1. Health & Readiness Endpoints
 # ---------------------------------------------------------------------------
-def validate_email(email):
-    pattern = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
-    return re.match(pattern, str(email).strip()) is not None
-
-def validate_phone(phone):
-    cleaned = re.sub(r"[\s\-\(\)]", "", str(phone))
-    pattern = r"^\+?[0-9]{7,15}$"
-    return re.match(pattern, cleaned) is not None
-
-# ---------------------------------------------------------------------------
-# Core / Root Endpoints
-# ---------------------------------------------------------------------------
-@app.route("/")
-def root():
+@app.route("/api/health", methods=["GET"])
+@app.route("/api/v1/health", methods=["GET"])
+def health_check():
     return jsonify({
-        "success": True,
-        "service": "Neoserve Projects Enterprise API",
-        "version": "1.2.0",
-        "apiBase": "/api/v1",
-        "documentation": "https://api.neoservepro.com/docs",
-        "status": "ONLINE",
-        "requestId": getattr(g, "request_id", None)
-    })
-
-@app.route("/api/health")
-@app.route("/api/v1/health")
-def health():
-    return jsonify({
-        "success": True,
         "status": "HEALTHY",
+        "service": "Neoserve Enterprise Clean Energy API",
+        "version": "2.1.0",
         "databaseEngine": db.mode,
-        "version": "1.2.0",
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "requestId": getattr(g, "request_id", None)
-    })
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "smtpConfigured": email_service.is_configured(),
+        "brochureAvailable": os.path.exists(BROCHURE_PDF_PATH)
+    }), 200
 
-@app.route("/api/v1/ready")
-def ready():
-    # Verify DB read access
-    try:
-        row = db.execute_read_one("SELECT 1 as is_ready")
-        return jsonify({
-            "ready": True,
-            "database": "CONNECTED",
-            "mode": db.mode,
-            "requestId": getattr(g, "request_id", None)
-        }), 200
-    except Exception as e:
-        return rfc9457_error(
-            title="Service Not Ready",
-            detail=f"Database probe failed: {str(e)}",
-            status=503
-        )
-
-@app.route("/api/v1/public/config")
-def public_config():
+# ---------------------------------------------------------------------------
+# 2. Company Profile & Project Brochure Endpoints
+# ---------------------------------------------------------------------------
+@app.route("/api/v1/company/overview", methods=["GET"])
+def get_company_overview():
     return jsonify({
         "success": True,
-        "company": {
-            "name": "Neoserve Projects Private Limited",
-            "tagline": "Empowering Sustainable Energy Infrastructure",
-            "supportPhone": "+91 98765 43210",
-            "supportEmail": "contact@neoservepro.com",
-            "website": "https://neoservepro.com"
-        },
-        "supportedServices": [
-            {"id": "solar-power", "name": "Utility & Commercial Solar PV"},
-            {"id": "wind-energy", "name": "Wind Turbine Generator (WTG) Erection"},
-            {"id": "hybrid-energy", "name": "Hybrid Wind-Solar Power Systems"},
-            {"id": "peb-structures", "name": "Pre-Engineered Buildings (PEB)"},
-            {"id": "ev-charging", "name": "Ultra-Fast EV Charging Infrastructure"},
-            {"id": "green-hydrogen", "name": "Green Hydrogen Auxiliary Solutions"}
+        "company": "Neoserve Projects",
+        "tagline": "Empowering Sustainable Growth",
+        "mission": "To lead the charge towards a sustainable, clean energy future, delivering innovative, reliable, and cost-effective green energy solutions.",
+        "nationalTarget": "Realization of India's ambitious target of achieving 500 GW of renewable energy by 2030, with a particular emphasis on decarbonizing carbon emissions.",
+        "3YearVision": "Evolution into a comprehensive EPC (Engineering, Procurement, and Construction) company specializing in Wind Power Projects, Solar Projects, PEB Structural Construction, EV Fast Charging Stations, Battery Storage (BESS), and Green Hydrogen Plants.",
+        "coreValues": [
+            "Customer Commitment",
+            "On Time Delivery of Projects",
+            "Equality",
+            "Respecting Culture",
+            "Team Work",
+            "Sustainable Growth",
+            "Transparency"
         ],
-        "appVersion": "2.4.0",
-        "maintenanceMode": False
-    })
+        "leadership": {
+            "keyPerson": "Dinesh Ahirwar",
+            "role": "Director / Operations Lead",
+            "directPhone": "+91 63756 96762",
+            "officialEmail": "info@neoservepro.com"
+        },
+        "headquarters": {
+            "email": "info@neoservepro.com",
+            "website": "www.neoservepro.com",
+            "country": "India"
+        }
+    }), 200
+
+@app.route("/api/v1/company/stats", methods=["GET"])
+def get_company_stats():
+    return jsonify({
+        "success": True,
+        "stats": {
+            "totalManagedCapacityMw": 455.0,
+            "annualCleanEnergyGeneratedGwh": 890.5,
+            "totalCo2OffsetTons": 820000,
+            "activeOperatingPlants": 6,
+            "averagePerformanceRatio": 82.4,
+            "turbinesInstalled": 60,
+            "pebStructuresAreaSqFt": 180000,
+            "evChargingGunsCommissioned": 24,
+            "india2030TargetGw": 500
+        }
+    }), 200
+
+@app.route("/api/v1/brochure/info", methods=["GET"])
+def get_brochure_info():
+    file_exists = os.path.exists(BROCHURE_PDF_PATH)
+    size_bytes = os.path.getsize(BROCHURE_PDF_PATH) if file_exists else 0
+    return jsonify({
+        "success": True,
+        "title": "Neoserve Projects — Corporate EPC Brochure",
+        "edition": "BF1 Official Edition",
+        "tagline": "Empowering Sustainable Growth",
+        "pagesCount": 4,
+        "format": "PDF",
+        "fileSizeBytes": size_bytes,
+        "downloadUrl": "/api/v1/brochure/download",
+        "keyHighlights": [
+            "Wind Turbine Generator (WTG) Heavy Nacelle & Blade Hoisting",
+            "Utility & Rooftop Solar PV Farms (India 500 GW Target)",
+            "Pre-Engineered Building (PEB) High-Speed Industrial Warehousing",
+            "Turnkey Multi-Gun DC EV Charging Infrastructure",
+            "Battery Storage (BESS) & Green Hydrogen Auxiliary Integration"
+        ],
+        "contact": {
+            "representative": "Dinesh Ahirwar",
+            "phone": "+91 63756 96762",
+            "email": "info@neoservepro.com",
+            "website": "www.neoservepro.com"
+        }
+    }), 200
+
+@app.route("/api/v1/brochure/download", methods=["GET"])
+def download_brochure():
+    if not os.path.exists(BROCHURE_PDF_PATH):
+        # Fallback to root pdf if static copy missing
+        root_pdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Neoderve Projects-BF1.pdf")
+        if os.path.exists(root_pdf):
+            return send_file(root_pdf, as_attachment=True, download_name="Neoserve_Projects_Brochure.pdf")
+        return rfc9457_error("Not Found", 404, "Corporate brochure PDF file not found on server.")
+    return send_file(BROCHURE_PDF_PATH, as_attachment=True, download_name="Neoserve_Projects_Brochure.pdf")
 
 # ---------------------------------------------------------------------------
-# Services Endpoints (Blueprint Section 7)
+# 3. Core EPC Services Endpoints (Populated from Brochure)
 # ---------------------------------------------------------------------------
-SERVICES_DATA = [
-    {
-        "id": "solar-power",
-        "title": "Utility & Rooftop Solar EPC",
-        "category": "Solar",
-        "capacityRange": "100 kW to 250 MW+",
-        "description": "Turnkey civil foundation, tracker/fixed MMS racking, DC/AC cabling, inverter duty transformers, and SCADA grid synchronization.",
-        "deliverables": ["Site radiation study", "MMS installation", "Inverter stations", "Net metering / Grid CEIG approvals"],
-        "icon": "ic_solar"
-    },
-    {
-        "id": "wind-energy",
-        "title": "Wind Turbine Generator (WTG) Erection",
-        "category": "Wind",
-        "capacityRange": "2.1 MW to 4.2 MW Class Turbines",
-        "description": "Heavy-lift crane mobilization, multi-section tower hoisting, nacelle & rotor assembly, high-tension torqueing, and 33kV bay integration.",
-        "deliverables": ["Foundation civil works", "Tower erection", "Rotor hoisting", "Commissioning support"],
-        "icon": "ic_wind"
-    },
-    {
-        "id": "hybrid-energy",
-        "title": "Hybrid Wind-Solar Parks",
-        "category": "Hybrid",
-        "capacityRange": "10 MW to 100 MW+",
-        "description": "Optimal land footprint utilization blending wind and solar profiles with common pooling substations for maximum grid evacuation.",
-        "deliverables": ["Complementary generation study", "Common pooling substation", "Battery Storage (BESS) integration"],
-        "icon": "ic_hybrid"
-    },
-    {
-        "id": "peb-structures",
-        "title": "Pre-Engineered Buildings (PEB)",
-        "category": "PEB",
-        "capacityRange": "10,000 to 500,000+ Sq Ft",
-        "description": "High-tensile structural steel fabrication, rapid on-site erection, standing seam roofing designed for solar rooftop loads.",
-        "deliverables": ["Structural engineering design", "Fabrication & delivery", "Erection & cladding", "Solar-ready roof certification"],
-        "icon": "ic_peb"
-    },
-    {
-        "id": "ev-charging",
-        "title": "Ultra-Fast Multi-Gun EV Charging Hubs",
-        "category": "EV Charging",
-        "capacityRange": "60 kW to 360 kW DC Fast Chargers",
-        "description": "Complete highway & fleet depot EV charging infrastructure with HT transformers, CCS2 guns, and OCPP 1.6/2.0 CMS integration.",
-        "deliverables": ["Discom transformer step-down", "Dual-gun DC fast chargers", "Payment kiosk & app CMS"],
-        "icon": "ic_ev"
-    }
-]
-
 @app.route("/api/v1/services", methods=["GET"])
 def get_services():
+    category = request.args.get("category")
+    if category:
+        rows = db.execute_read_all("SELECT * FROM services WHERE is_active = 1 AND category = ? ORDER BY id ASC", (category,))
+    else:
+        rows = db.execute_read_all("SELECT * FROM services WHERE is_active = 1 ORDER BY id ASC")
+
+    services_list = []
+    for r in rows:
+        srv = dict(r)
+        if isinstance(srv.get("steps_json"), str):
+            try:
+                srv["steps"] = json.loads(srv["steps_json"])
+            except Exception:
+                srv["steps"] = []
+        elif isinstance(srv.get("steps_json"), list):
+            srv["steps"] = srv["steps_json"]
+
+        if isinstance(srv.get("components_json"), str):
+            try:
+                srv["components"] = json.loads(srv["components_json"])
+            except Exception:
+                srv["components"] = []
+        elif isinstance(srv.get("components_json"), list):
+            srv["components"] = srv["components_json"]
+
+        srv.pop("steps_json", None)
+        srv.pop("components_json", None)
+        services_list.append(srv)
+
     return jsonify({
         "success": True,
-        "count": len(SERVICES_DATA),
-        "services": SERVICES_DATA
-    })
+        "count": len(services_list),
+        "services": services_list
+    }), 200
 
 @app.route("/api/v1/services/<service_id>", methods=["GET"])
-def get_service_by_id(service_id):
-    svc = next((s for s in SERVICES_DATA if s["id"] == service_id.lower()), None)
-    if not svc:
-        return rfc9457_error(title="Service Not Found", detail=f"No service found with ID '{service_id}'", status=404)
-    return jsonify({"success": True, "service": svc})
+def get_service_detail(service_id):
+    row = db.execute_read_one("SELECT * FROM services WHERE id = ? OR slug = ?", (service_id, service_id))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Service with ID/slug '{service_id}' does not exist.")
+
+    srv = dict(row)
+    if isinstance(srv.get("steps_json"), str):
+        try:
+            srv["steps"] = json.loads(srv["steps_json"])
+        except Exception:
+            srv["steps"] = []
+    elif isinstance(srv.get("steps_json"), list):
+        srv["steps"] = srv["steps_json"]
+
+    if isinstance(srv.get("components_json"), str):
+        try:
+            srv["components"] = json.loads(srv["components_json"])
+        except Exception:
+            srv["components"] = []
+    elif isinstance(srv.get("components_json"), list):
+        srv["components"] = srv["components_json"]
+
+    srv.pop("steps_json", None)
+    srv.pop("components_json", None)
+    return jsonify({"success": True, "service": srv}), 200
 
 # ---------------------------------------------------------------------------
-# Leads & CRM Management (Blueprint Section 7, 8, 9, 10)
+# 4. Clean Energy Projects Portfolio Endpoints
 # ---------------------------------------------------------------------------
-@app.route("/api/v1/leads", methods=["POST"])
-def create_lead():
-    # 1. Idempotency Check
-    idempotency_key = request.headers.get("Idempotency-Key")
-    if idempotency_key:
-        cached = db.execute_read_one(
-            "SELECT response_json, status_code FROM idempotency_keys WHERE idempotency_key = ?",
-            (idempotency_key,)
-        )
-        if cached:
-            return jsonify(json.loads(cached["response_json"])), cached["status_code"]
-
-    data = request.get_json(silent=True) or {}
-    errors = []
-
-    # Field extraction (supports both Blueprint v1 naming & mobile app field names)
-    full_name = str(data.get("fullName") or data.get("name") or "").strip()
-    email = str(data.get("email") or "").strip()
-    phone = str(data.get("phone") or "").strip()
-    company = str(data.get("company") or "").strip()
-    service_id = str(data.get("serviceId") or data.get("service_type") or "").strip()
-    project_type = str(data.get("projectType") or data.get("project_type") or service_id or "Renewable Energy").strip()
-    location_raw = data.get("location")
-    capacity_raw = data.get("capacity")
-    timeline = str(data.get("timeline") or "").strip()
-    budget_range = str(data.get("budgetRange") or data.get("budget_range") or "").strip()
-    message = str(data.get("message") or "").strip()
-    consent = data.get("consent", True)
-    source = str(data.get("source") or "mobile_app").strip()
-    campaign = str(data.get("campaign") or "").strip()
-
-    # Location formatting
-    if isinstance(location_raw, dict):
-        location_str = f"{location_raw.get('city', '')}, {location_raw.get('state', '')}, {location_raw.get('country', 'IN')}".strip(", ")
-    else:
-        location_str = str(location_raw or "").strip()
-
-    # Capacity formatting
-    if isinstance(capacity_raw, dict):
-        capacity_str = f"{capacity_raw.get('value', '')} {capacity_raw.get('unit', '')}".strip()
-    else:
-        capacity_str = str(capacity_raw or "").strip()
-
-    # Validations
-    if not full_name:
-        errors.append({"field": "fullName", "code": "required", "message": "Full name is required."})
-    elif len(full_name) > 100:
-        errors.append({"field": "fullName", "code": "max_length", "message": "Name cannot exceed 100 characters."})
-
-    if not email:
-        errors.append({"field": "email", "code": "required", "message": "Email address is required."})
-    elif not validate_email(email):
-        errors.append({"field": "email", "code": "invalid_format", "message": "Please enter a valid email address."})
-
-    if not phone:
-        errors.append({"field": "phone", "code": "required", "message": "Phone number is required."})
-    elif not validate_phone(phone):
-        errors.append({"field": "phone", "code": "invalid_format", "message": "Please enter a valid phone number."})
-
-    if not message:
-        errors.append({"field": "message", "code": "required", "message": "Project details or message is required."})
-
-    if errors:
-        return rfc9457_error(
-            title="Validation failed",
-            detail="One or more fields in the enquiry submission are invalid.",
-            status=422,
-            errors=errors
-        )
-
-    # Generate Lead ID
-    lead_id = f"ld_{uuid.uuid4().hex[:10]}"
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-
-    # Insert into leads table
-    db.execute_write(
-        """
-        INSERT INTO leads (
-            id, full_name, email, phone, company, service_id, project_type,
-            location, capacity, timeline, budget_range, message, status,
-            score, source, campaign, idempotency_key, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', 50, ?, ?, ?, ?, ?)
-        """,
-        (
-            lead_id, full_name, email, phone, company, service_id, project_type,
-            location_str, capacity_str, timeline, budget_range, message,
-            source, campaign, idempotency_key, now_iso, now_iso
-        )
-    )
-
-    # Also store into contacts table for backwards compatibility
-    db.execute_write(
-        """
-        INSERT INTO contacts (name, email, phone, company, project_type, message, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (full_name, email, phone, company, project_type, message, now_iso)
-    )
-
-    # Auto-generate SLA Review Task (Blueprint Section 9)
-    task_id = f"tsk_{uuid.uuid4().hex[:8]}"
-    db.execute_write(
-        """
-        INSERT INTO tasks (id, entity_type, entity_id, title, due_at, priority, status, created_at)
-        VALUES (?, 'LEAD', ?, ?, ?, 'HIGH', 'PENDING', ?)
-        """,
-        (task_id, lead_id, f"Review new enquiry from {full_name} ({company or 'Individual'})", "24 hours", now_iso)
-    )
-
-    # Initial Activity Log
-    act_id = f"act_{uuid.uuid4().hex[:8]}"
-    db.execute_write(
-        """
-        INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, created_by, created_at)
-        VALUES (?, ?, 'SYSTEM_EVENT', 'Enquiry Captured', ?, 'System', ?)
-        """,
-        (act_id, lead_id, f"Source: {source}. Assigned initial status: NEW. Qualification task created.", now_iso)
-    )
-
-    response_payload = {
-        "success": True,
-        "leadId": lead_id,
-        "status": "NEW",
-        "message": "Your enquiry has been submitted successfully.",
-        "nextStep": "Our technical sales team will review your requirements and reach out within 24 hours.",
-        "createdAt": now_iso
-    }
-
-    # Cache for Idempotency
-    if idempotency_key:
-        db.execute_write(
-            "INSERT OR REPLACE INTO idempotency_keys (idempotency_key, response_json, status_code) VALUES (?, ?, ?)",
-            (idempotency_key, json.dumps(response_payload), 201)
-        )
-
-    return jsonify(response_payload), 201
-
-# Backwards Compatible /api/contact endpoint (Matching original Render server)
-@app.route("/api/contact", methods=["POST"])
-def legacy_contact():
-    data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    email = str(data.get("email", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    company = str(data.get("company", "")).strip()
-    project_type = str(data.get("project_type", "")).strip()
-    location = str(data.get("location", "")).strip()
-    message = str(data.get("message", "")).strip()
-
-    if not name or not email or not phone or not message:
-        return jsonify({
-            "success": False,
-            "message": "Required fields: name, email, phone, message"
-        }), 400
-
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-    contact_id = db.execute_write(
-        """
-        INSERT INTO contacts (name, email, phone, company, project_type, message, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (name, email, phone, company, project_type, message, now_iso)
-    )
-
-    # Also record into leads table
-    lead_id = f"ld_{uuid.uuid4().hex[:10]}"
-    db.execute_write(
-        """
-        INSERT INTO leads (id, full_name, email, phone, company, project_type, location, message, status, source, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'NEW', 'legacy_contact_form', ?, ?)
-        """,
-        (lead_id, name, email, phone, company, project_type, location, message, now_iso, now_iso)
-    )
-
-    return jsonify({
-        "success": True,
-        "message": "Your enquiry has been submitted successfully",
-        "contact_id": contact_id or 1,
-        "lead_id": lead_id,
-        "created_at": now_iso
-    }), 201
-
-@app.route("/api/v1/leads/check-duplicate", methods=["POST"])
-def check_duplicate_lead():
-    data = request.get_json(silent=True) or {}
-    email = str(data.get("email", "")).strip().lower()
-    phone = str(data.get("phone", "")).strip()
-
-    row = db.execute_read_one(
-        "SELECT id, full_name, status, created_at FROM leads WHERE LOWER(email) = ? OR phone = ? ORDER BY created_at DESC LIMIT 1",
-        (email, phone)
-    )
-    if row:
-        return jsonify({
-            "duplicateFound": True,
-            "leadId": row["id"],
-            "existingStatus": row["status"],
-            "submittedAt": row["created_at"],
-            "message": "An active enquiry already exists with this contact information."
-        })
-    return jsonify({
-        "duplicateFound": False,
-        "message": "No duplicate enquiry found."
-    })
-
-@app.route("/api/v1/leads", methods=["GET"])
-def list_leads():
-    status = request.args.get("status")
-    query = request.args.get("query", "").strip()
-    page = max(1, int(request.args.get("page", 1)))
-    limit = min(100, max(1, int(request.args.get("limit", 20))))
-    offset = (page - 1) * limit
-
-    conditions = []
-    params = []
-    if status:
-        conditions.append("status = ?")
-        params.append(status.upper())
-    if query:
-        conditions.append("(full_name LIKE ? OR email LIKE ? OR company LIKE ?)")
-        params.extend([f"%{query}%", f"%{query}%", f"%{query}%"])
-
-    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    total_row = db.execute_read_one(f"SELECT COUNT(*) as total FROM leads {where_clause}", tuple(params))
-    total = total_row["total"] if total_row else 0
-
-    list_query = f"SELECT * FROM leads {where_clause} ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
-    items = db.execute_read_all(list_query, tuple(params))
-
-    return jsonify({
-        "success": True,
-        "items": items,
-        "pagination": {
-            "page": page,
-            "limit": limit,
-            "total": total,
-            "pages": (total + limit - 1) // limit
-        }
-    })
-
-@app.route("/api/v1/leads/<lead_id>", methods=["GET"])
-def get_lead_detail(lead_id):
-    lead = db.execute_read_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
-    if not lead:
-        return rfc9457_error(title="Lead Not Found", detail=f"No lead found with ID {lead_id}", status=404)
-    activities = db.execute_read_all("SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC", (lead_id,))
-    tasks = db.execute_read_all("SELECT * FROM tasks WHERE entity_type = 'LEAD' AND entity_id = ? ORDER BY created_at DESC", (lead_id,))
-    return jsonify({
-        "success": True,
-        "lead": lead,
-        "timeline": activities,
-        "tasks": tasks
-    })
-
-@app.route("/api/v1/leads/<lead_id>/status", methods=["PATCH"])
-def update_lead_status(lead_id):
-    data = request.get_json(silent=True) or {}
-    new_status = str(data.get("status", "")).strip().upper()
-    valid_statuses = [
-        "NEW", "QUALIFYING", "QUALIFIED", "SITE_VISIT_PENDING",
-        "PROPOSAL_REQUIRED", "PROPOSAL_SENT", "NEGOTIATION",
-        "WON", "LOST", "ON_HOLD", "SPAM"
-    ]
-    if new_status not in valid_statuses:
-        return rfc9457_error(
-            title="Invalid Status",
-            detail=f"Status must be one of: {', '.join(valid_statuses)}",
-            status=422
-        )
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-    updated = db.execute_write(
-        "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
-        (new_status, now_iso, lead_id)
-    )
-    # Log status change activity
-    act_id = f"act_{uuid.uuid4().hex[:8]}"
-    db.execute_write(
-        """
-        INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, created_by, created_at)
-        VALUES (?, ?, 'STATUS_CHANGE', ?, ?, 'Staff', ?)
-        """,
-        (act_id, lead_id, f"Status updated to {new_status}", data.get("notes", "Status moved in CRM"), now_iso)
-    )
-    return jsonify({
-        "success": True,
-        "leadId": lead_id,
-        "newStatus": new_status,
-        "updatedAt": now_iso
-    })
-
-@app.route("/api/v1/leads/<lead_id>/activities", methods=["GET", "POST"])
-def lead_activities(lead_id):
-    if request.method == "POST":
-        data = request.get_json(silent=True) or {}
-        act_type = str(data.get("type") or "NOTE").strip()
-        subject = str(data.get("subject") or "Follow-up Activity").strip()
-        notes = str(data.get("notes") or "").strip()
-        outcome = str(data.get("outcome") or "").strip()
-        created_by = str(data.get("createdBy") or "Sales Rep").strip()
-        act_id = f"act_{uuid.uuid4().hex[:8]}"
-        now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-
-        db.execute_write(
-            """
-            INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, outcome, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (act_id, lead_id, act_type, subject, notes, outcome, created_by, now_iso)
-        )
-        return jsonify({
-            "success": True,
-            "activityId": act_id,
-            "message": "Activity recorded successfully"
-        }), 201
-
-    activities = db.execute_read_all(
-        "SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC",
-        (lead_id,)
-    )
-    return jsonify({"success": True, "activities": activities})
-
-# ---------------------------------------------------------------------------
-# Tasks Management (Blueprint Section 7, 10)
-# ---------------------------------------------------------------------------
-@app.route("/api/v1/tasks", methods=["GET", "POST"])
-def handle_tasks():
-    if request.method == "POST":
-        data = request.get_json(silent=True) or {}
-        title = str(data.get("title", "")).strip()
-        entity_type = str(data.get("entityType", "LEAD")).strip().upper()
-        entity_id = str(data.get("entityId", "")).strip()
-        due_at = str(data.get("dueAt", "")).strip()
-        priority = str(data.get("priority", "MEDIUM")).strip().upper()
-
-        if not title or not entity_id:
-            return rfc9457_error(title="Missing Fields", detail="Task title and entityId are required.", status=422)
-
-        task_id = f"tsk_{uuid.uuid4().hex[:8]}"
-        now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-        db.execute_write(
-            """
-            INSERT INTO tasks (id, entity_type, entity_id, title, due_at, priority, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
-            """,
-            (task_id, entity_type, entity_id, title, due_at, priority, now_iso)
-        )
-        return jsonify({"success": True, "taskId": task_id, "message": "Task created successfully"}), 201
-
-    status = request.args.get("status")
-    query = "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC" if status else "SELECT * FROM tasks ORDER BY created_at DESC"
-    params = (status.upper(),) if status else ()
-    tasks = db.execute_read_all(query, params)
-    return jsonify({"success": True, "tasks": tasks})
-
-@app.route("/api/v1/tasks/<task_id>", methods=["PATCH"])
-def update_task(task_id):
-    data = request.get_json(silent=True) or {}
-    new_status = str(data.get("status", "COMPLETED")).strip().upper()
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-    completed_at = now_iso if new_status == "COMPLETED" else None
-
-    db.execute_write(
-        "UPDATE tasks SET status = ?, completed_at = ? WHERE id = ?",
-        (new_status, completed_at, task_id)
-    )
-    return jsonify({"success": True, "taskId": task_id, "status": new_status})
-
-# ---------------------------------------------------------------------------
-# Projects Portfolio Endpoints (Integrated with Android App)
-# ---------------------------------------------------------------------------
-@app.route("/api/projects", methods=["GET"])
 @app.route("/api/v1/projects", methods=["GET"])
 def get_projects():
-    category = request.args.get("category", "All").strip()
-    query = request.args.get("query", "").strip()
+    category = request.args.get("category")
+    search = request.args.get("search")
 
-    sql = "SELECT * FROM projects"
-    conditions = []
+    query = "SELECT * FROM projects WHERE 1=1"
     params = []
 
     if category and category.lower() != "all":
-        conditions.append("LOWER(category) = ?")
-        params.append(category.lower())
+        query += " AND LOWER(category) = LOWER(?)"
+        params.append(category)
 
-    if query:
-        conditions.append("(LOWER(title) LIKE ? OR LOWER(client_name) LIKE ? OR LOWER(location) LIKE ?)")
-        params.extend([f"%{query.lower()}%", f"%{query.lower()}%", f"%{query.lower()}%"])
+    if search:
+        search_term = f"%{search}%"
+        query += " AND (title LIKE ? OR location LIKE ? OR client_name LIKE ? OR scope_of_work LIKE ?)"
+        params.extend([search_term, search_term, search_term, search_term])
 
-    if conditions:
-        sql += f" WHERE {' AND '.join(conditions)}"
-    sql += " ORDER BY created_at DESC"
+    query += " ORDER BY completion_year DESC, id ASC"
+    rows = db.execute_read_all(query, tuple(params))
 
-    projects = db.execute_read_all(sql, tuple(params))
+    projects = []
+    for r in rows:
+        p = dict(r)
+        if isinstance(p.get("metrics_json"), str):
+            try:
+                p["metrics"] = json.loads(p["metrics_json"])
+            except Exception:
+                p["metrics"] = {}
+        elif isinstance(p.get("metrics_json"), dict):
+            p["metrics"] = p["metrics_json"]
+        p.pop("metrics_json", None)
+        projects.append(p)
+
     return jsonify({
         "success": True,
         "count": len(projects),
         "projects": projects
-    })
+    }), 200
 
 @app.route("/api/v1/projects/<project_id>", methods=["GET"])
 def get_project_detail(project_id):
-    project = db.execute_read_one("SELECT * FROM projects WHERE id = ?", (project_id,))
-    if not project:
-        return rfc9457_error(title="Project Not Found", detail=f"No project found with ID '{project_id}'", status=404)
-    return jsonify({"success": True, "project": project})
+    row = db.execute_read_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Project '{project_id}' was not found in portfolio.")
+    p = dict(row)
+    if isinstance(p.get("metrics_json"), str):
+        try:
+            p["metrics"] = json.loads(p["metrics_json"])
+        except Exception:
+            p["metrics"] = {}
+    elif isinstance(p.get("metrics_json"), dict):
+        p["metrics"] = p["metrics_json"]
+    p.pop("metrics_json", None)
+    return jsonify({"success": True, "project": p}), 200
 
 # ---------------------------------------------------------------------------
-# Energy Yield & ROI Calculator (Blueprint / Android App Feature)
+# 5. Leads & CRM Endpoints (Mobile App + Website Integration)
 # ---------------------------------------------------------------------------
-@app.route("/api/calculator/estimate", methods=["POST"])
-@app.route("/api/v1/calculator/estimate", methods=["POST"])
-def calculate_yield():
-    data = request.get_json(silent=True) or {}
-    project_type = str(data.get("project_type") or data.get("projectType") or "Solar").strip()
-    monthly_bill = float(data.get("monthly_bill_inr") or data.get("monthlyBillInr") or 0.0)
-    target_capacity = float(data.get("target_capacity_kw") or data.get("targetCapacityKw") or 0.0)
-    state = str(data.get("state_location") or data.get("stateLocation") or "Gujarat").strip()
+@app.route("/api/contact", methods=["POST"])
+@app.route("/api/v1/leads", methods=["POST"])
+def submit_lead():
+    data = get_request_data()
+    idempotency_key = request.headers.get("Idempotency-Key") or data.get("idempotencyKey")
 
-    if target_capacity > 0:
-        capacity_kw = target_capacity
-    elif monthly_bill > 0:
-        capacity_kw = max(5.0, round(monthly_bill / 800.0, 1))
-    else:
-        capacity_kw = 50.0
+    # If idempotency key provided, check for duplicate submission
+    if idempotency_key:
+        cached = db.execute_read_one("SELECT * FROM leads WHERE idempotency_key = ?", (idempotency_key,))
+        if cached:
+            return jsonify({
+                "success": True,
+                "leadId": cached["id"],
+                "status": cached["status"],
+                "message": "Enquiry already recorded. Our engineering team is processing your request.",
+                "cached": True,
+                "createdAt": cached["created_at"]
+            }), 201
 
-    is_wind = "wind" in project_type.lower()
-    is_solar = "solar" in project_type.lower()
+    # Extract fields with support for both v1 and legacy names
+    full_name = data.get("fullName") or data.get("name") or ""
+    email = data.get("email") or ""
+    phone = data.get("phone") or ""
+    company = data.get("company") or ""
+    service_id = data.get("serviceId") or ""
+    project_type = data.get("projectType") or data.get("project_type") or "Clean Energy EPC"
+    location = data.get("location") or ""
+    capacity = data.get("capacity") or ""
+    timeline = data.get("timeline") or ""
+    budget_range = data.get("budgetRange") or data.get("budget_range") or ""
+    message = data.get("message") or ""
+    source = data.get("source") or ("android_app" if "android" in request.headers.get("User-Agent", "").lower() else "website")
+    campaign = data.get("campaign") or ""
 
-    if is_wind:
-        gen_factor = 2200.0  # kWh per kW per year
-        cost_per_kw = 65000.0
-    elif is_solar:
-        gen_factor = 1550.0
-        cost_per_kw = 42000.0
-    else:  # Hybrid
-        gen_factor = 1800.0
-        cost_per_kw = 55000.0
+    # Validation
+    errors = []
+    if not full_name or len(full_name.strip()) < 2:
+        errors.append({"field": "fullName", "code": "invalid_length", "message": "Full name must be at least 2 characters."})
+    if not email or "@" not in email or "." not in email:
+        errors.append({"field": "email", "code": "invalid_format", "message": "A valid email address is required."})
+    if not phone or len(phone.strip()) < 7:
+        errors.append({"field": "phone", "code": "invalid_length", "message": "A valid contact phone number is required."})
+    if not message or len(message.strip()) < 5:
+        errors.append({"field": "message", "code": "invalid_length", "message": "Please describe your project requirements in at least 5 characters."})
 
-    annual_kwh = round(capacity_kw * gen_factor, 1)
-    tariff = 8.50  # Average commercial tariff INR
-    annual_savings = round(annual_kwh * tariff, 2)
-    total_cost = capacity_kw * cost_per_kw
-    cost_lakhs = f"{round(total_cost / 100000.0, 2)} - {round((total_cost * 1.1) / 100000.0, 2)} Lakhs"
-    payback_years = round(total_cost / annual_savings, 1) if annual_savings > 0 else 4.2
-    co2_offset_tons = round((annual_kwh * 0.82) / 1000.0, 1)
+    if errors:
+        return rfc9457_error("Unprocessable Entity", 422, "Please correct the highlighted form errors.", invalid_params=errors)
+
+    lead_id = f"ld_{uuid.uuid4().hex[:10]}"
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Lead qualification scoring
+    score = 50
+    if budget_range:
+        score += 15
+    if capacity:
+        score += 15
+    if company:
+        score += 10
+    if len(message) > 50:
+        score += 10
+
+    # 1. Insert into leads table
+    db.execute_write(
+        """
+        INSERT INTO leads (id, full_name, email, phone, company, service_id, project_type, location, capacity, timeline, budget_range, message, status, score, source, campaign, idempotency_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, ?)
+        """,
+        (lead_id, full_name.strip(), email.strip().lower(), phone.strip(), company.strip(), service_id, project_type, location.strip(), capacity.strip(), timeline, budget_range, message.strip(), score, source, campaign, idempotency_key)
+    )
+
+    # 2. Insert into legacy contacts table for complete backward compatibility
+    contact_id = db.execute_write(
+        """
+        INSERT INTO contacts (name, email, phone, company, project_type, message)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (full_name.strip(), email.strip().lower(), phone.strip(), company.strip(), project_type, message.strip())
+    )
+
+    # 3. Create 24-hour SLA task for Dinesh Ahirwar
+    task_id = f"tsk_{uuid.uuid4().hex[:10]}"
+    due_tomorrow = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
+    db.execute_write(
+        """
+        INSERT INTO tasks (id, entity_type, entity_id, title, owner_id, due_at, priority, status)
+        VALUES (?, 'LEAD', ?, ?, 'dinesh.ahirwar', ?, 'HIGH', 'PENDING')
+        """,
+        (task_id, lead_id, f"Review & Qualify Lead {lead_id} - {full_name} ({project_type})", due_tomorrow)
+    )
+
+    # 4. Trigger Asynchronous Email Notifications
+    lead_summary = {
+        "id": lead_id,
+        "fullName": full_name.strip(),
+        "email": email.strip().lower(),
+        "phone": phone.strip(),
+        "company": company.strip(),
+        "serviceId": service_id,
+        "projectType": project_type,
+        "location": location.strip(),
+        "capacity": capacity.strip(),
+        "timeline": timeline,
+        "budgetRange": budget_range,
+        "message": message.strip(),
+        "source": source
+    }
+    email_service.send_lead_notifications(lead_summary)
 
     return jsonify({
         "success": True,
-        "recommended_capacity_kw": capacity_kw,
-        "annual_generation_kwh": annual_kwh,
-        "estimated_cost_lakhs_inr": cost_lakhs,
-        "annual_savings_inr": annual_savings,
-        "payback_period_years": payback_years,
-        "carbon_offset_tons_per_year": co2_offset_tons,
-        "message": f"Calculated using regional radiation & tariff models for {state}."
-    })
+        "leadId": lead_id,
+        "status": "NEW",
+        "contactId": contact_id,
+        "message": "Your project requirement has been submitted successfully to Neoserve Projects.",
+        "nextStep": "Our technical engineering team led by Dinesh Ahirwar will review your requirements and reach out within 24 hours.",
+        "createdAt": now_iso
+    }), 201
+
+@app.route("/api/v1/leads/check-duplicate", methods=["POST"])
+def check_duplicate_lead():
+    data = get_request_data()
+    email = data.get("email", "").strip().lower()
+    phone = data.get("phone", "").strip()
+
+    if not email and not phone:
+        return rfc9457_error("Bad Request", 400, "Provide either email or phone to check for duplicate enquiries.")
+
+    lead = None
+    if email:
+        lead = db.execute_read_one("SELECT id, full_name, status, created_at FROM leads WHERE email = ? ORDER BY created_at DESC", (email,))
+    if not lead and phone:
+        lead = db.execute_read_one("SELECT id, full_name, status, created_at FROM leads WHERE phone = ? ORDER BY created_at DESC", (phone,))
+
+    if lead:
+        return jsonify({
+            "isDuplicate": True,
+            "existingLeadId": lead["id"],
+            "status": lead["status"],
+            "createdAt": lead["created_at"],
+            "message": f"An existing enquiry ({lead['id']}) is already on file for {lead.get('full_name')}."
+        }), 200
+
+    return jsonify({"isDuplicate": False, "message": "No duplicate enquiry found."}), 200
+
+@app.route("/api/v1/leads", methods=["GET"])
+def list_leads():
+    status = request.args.get("status")
+    service_id = request.args.get("serviceId")
+    query = "SELECT * FROM leads WHERE 1=1"
+    params = []
+
+    if status:
+        query += " AND status = ?"
+        params.append(status.upper())
+    if service_id:
+        query += " AND service_id = ?"
+        params.append(service_id)
+
+    query += " ORDER BY created_at DESC"
+    rows = db.execute_read_all(query, tuple(params))
+    return jsonify({
+        "success": True,
+        "count": len(rows),
+        "leads": rows
+    }), 200
+
+@app.route("/api/v1/leads/<lead_id>", methods=["GET"])
+def get_lead(lead_id):
+    row = db.execute_read_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Lead '{lead_id}' does not exist.")
+    activities = db.execute_read_all("SELECT * FROM lead_activities WHERE lead_id = ? ORDER BY created_at DESC", (lead_id,))
+    tasks = db.execute_read_all("SELECT * FROM tasks WHERE entity_type = 'LEAD' AND entity_id = ? ORDER BY created_at DESC", (lead_id,))
+    result = dict(row)
+    result["activities"] = activities
+    result["tasks"] = tasks
+    return jsonify({"success": True, "lead": result}), 200
+
+@app.route("/api/v1/leads/<lead_id>", methods=["PATCH"])
+def update_lead(lead_id):
+    row = db.execute_read_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Lead '{lead_id}' does not exist.")
+
+    data = get_request_data()
+    status = data.get("status")
+    score = data.get("score")
+    owner_id = data.get("ownerId")
+
+    allowed_statuses = ["NEW", "CONTACTED", "QUALIFIED", "SITE_AUDIT", "PROPOSAL_SENT", "WON", "LOST"]
+    if status and status.upper() not in allowed_statuses:
+        return rfc9457_error("Bad Request", 400, f"Invalid status '{status}'. Allowed: {', '.join(allowed_statuses)}")
+
+    updates = []
+    params = []
+    if status:
+        updates.append("status = ?")
+        params.append(status.upper())
+    if score is not None:
+        updates.append("score = ?")
+        params.append(int(score))
+    if owner_id:
+        updates.append("owner_id = ?")
+        params.append(owner_id)
+
+    if not updates:
+        return jsonify({"success": True, "message": "No changes specified."}), 200
+
+    params.append(lead_id)
+    sql = f"UPDATE leads SET {', '.join(updates)} WHERE id = ?"
+    db.execute_write(sql, tuple(params))
+
+    # Log activity
+    act_id = f"act_{uuid.uuid4().hex[:8]}"
+    db.execute_write(
+        "INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, created_by) VALUES (?, ?, 'STATUS_UPDATE', ?, ?, 'Dinesh Ahirwar')",
+        (act_id, lead_id, f"Lead updated to {status or 'updated'}", f"Score: {score}, Owner: {owner_id}")
+    )
+
+    return jsonify({"success": True, "leadId": lead_id, "status": status or row["status"]}), 200
+
+@app.route("/api/v1/leads/<lead_id>/activities", methods=["POST"])
+def add_lead_activity(lead_id):
+    row = db.execute_read_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Lead '{lead_id}' does not exist.")
+
+    data = get_request_data()
+    act_type = data.get("activityType", "CALL")
+    subject = data.get("subject", "Follow-up discussion")
+    notes = data.get("notes", "")
+    outcome = data.get("outcome", "")
+    created_by = data.get("createdBy", "Dinesh Ahirwar")
+
+    act_id = f"act_{uuid.uuid4().hex[:8]}"
+    db.execute_write(
+        "INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, outcome, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (act_id, lead_id, act_type, subject, notes, outcome, created_by)
+    )
+    return jsonify({"success": True, "activityId": act_id, "leadId": lead_id}), 201
 
 # ---------------------------------------------------------------------------
-# Live Telemetry Overview (Blueprint Section 7 / Android Feature)
+# 6. Tasks Management (24-Hour SLA Queue)
 # ---------------------------------------------------------------------------
-@app.route("/api/telemetry/overview", methods=["GET"])
+@app.route("/api/v1/tasks", methods=["GET"])
+def list_tasks():
+    status = request.args.get("status")
+    query = "SELECT * FROM tasks WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = ?"
+        params.append(status.upper())
+    query += " ORDER BY due_at ASC, created_at DESC"
+    rows = db.execute_read_all(query, tuple(params))
+    return jsonify({"success": True, "count": len(rows), "tasks": rows}), 200
+
+@app.route("/api/v1/tasks/<task_id>/complete", methods=["POST"])
+def complete_task(task_id):
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute_write("UPDATE tasks SET status = 'COMPLETED', completed_at = ? WHERE id = ?", (now_iso, task_id))
+    return jsonify({"success": True, "taskId": task_id, "status": "COMPLETED"}), 200
+
+# ---------------------------------------------------------------------------
+# 7. Energy Yield & ROI Feasibility Calculator
+# ---------------------------------------------------------------------------
+@app.route("/api/v1/calculator/yield-roi", methods=["POST"])
+def calculate_energy_yield():
+    data = get_request_data()
+    project_type = data.get("projectType", "Solar").strip().capitalize()
+    monthly_bill = float(data.get("monthlyBillInr", 0) or 0)
+    target_capacity_kw = float(data.get("targetCapacityKw", 0) or 0)
+    state = data.get("stateLocation", "Gujarat")
+
+    # Tariff assumptions (INR / kWh)
+    tariff = 8.50 if state.lower() in ("maharashtra", "delhi") else 7.50
+
+    if target_capacity_kw <= 0 and monthly_bill > 0:
+        monthly_units = monthly_bill / tariff
+        daily_units = monthly_units / 30.0
+        # Average sun hours ~ 4.5 hrs / day
+        target_capacity_kw = round(daily_units / 4.5, 1)
+
+    if target_capacity_kw <= 0:
+        target_capacity_kw = 50.0  # default 50 kW commercial system
+
+    if "wind" in project_type.lower():
+        # High CUF wind calculation (~32% CUF)
+        annual_gen_kwh = round(target_capacity_kw * 8760 * 0.32, 0)
+        est_cost_lakhs = round(target_capacity_kw * 0.65, 2)  # ~65k INR / kW
+        annual_savings = round(annual_gen_kwh * 6.2, 0)
+    elif "hybrid" in project_type.lower():
+        # Hybrid Wind-Solar with BESS (~42% CUF)
+        annual_gen_kwh = round(target_capacity_kw * 8760 * 0.42, 0)
+        est_cost_lakhs = round(target_capacity_kw * 0.75, 2)
+        annual_savings = round(annual_gen_kwh * 7.0, 0)
+    else:
+        # Standard High Efficiency Bifacial Solar (1550 kWh/kWp/year)
+        annual_gen_kwh = round(target_capacity_kw * 1550, 0)
+        est_cost_lakhs = round(target_capacity_kw * 0.48, 2)  # ~48k INR / kW
+        annual_savings = round(annual_gen_kwh * tariff, 0)
+
+    total_est_cost_inr = est_cost_lakhs * 100000.0
+    payback_years = round(total_est_cost_inr / annual_savings, 1) if annual_savings > 0 else 4.5
+    carbon_offset_tons = round(annual_gen_kwh * 0.00082, 1)  # 0.82 kg CO2 per kWh grid baseline
+
+    return jsonify({
+        "success": True,
+        "projectType": project_type,
+        "recommendedCapacityKw": target_capacity_kw,
+        "annualGenerationKwh": annual_gen_kwh,
+        "estimatedCostLakhsInr": f"{est_cost_lakhs:.2f} Lakhs",
+        "estimatedCostTotalInr": total_est_cost_inr,
+        "annualSavingsInr": annual_savings,
+        "paybackPeriodYears": payback_years,
+        "carbonOffsetTonsPerYear": carbon_offset_tons,
+        "state": state,
+        "message": f"A {target_capacity_kw} kW {project_type} system in {state} pays for itself in ~{payback_years} years and offsets {carbon_offset_tons} tons of CO2 annually."
+    }), 200
+
+# ---------------------------------------------------------------------------
+# 8. Live O&M Telemetry & Plant Monitoring
+# ---------------------------------------------------------------------------
 @app.route("/api/v1/telemetry/overview", methods=["GET"])
 def get_telemetry_overview():
-    plants = [
-        {
-            "site_name": "Gujarat Kutch Wind Farm (25 MW)",
-            "category": "Wind",
-            "capacity_mw": 25.0,
-            "current_generation_kw": 21450.0,
-            "daily_energy_mwh": 188.4,
-            "performance_ratio_percent": 98.6,
-            "status": "Operational",
-            "last_updated": "1 min ago"
-        },
-        {
-            "site_name": "Rajasthan Bhadla Solar Park (50 MW)",
-            "category": "Solar",
-            "capacity_mw": 50.0,
-            "current_generation_kw": 46200.0,
-            "daily_energy_mwh": 312.8,
-            "performance_ratio_percent": 99.1,
-            "status": "Operational",
-            "last_updated": "Just now"
-        },
-        {
-            "site_name": "Tamil Nadu Hybrid Facility (45 MW)",
-            "category": "Hybrid",
-            "capacity_mw": 45.0,
-            "current_generation_kw": 39800.0,
-            "daily_energy_mwh": 245.2,
-            "performance_ratio_percent": 97.9,
-            "status": "Operational",
-            "last_updated": "2 mins ago"
-        },
-        {
-            "site_name": "Bengaluru EV Fast Charger Hub",
-            "category": "EV Charging",
-            "capacity_mw": 0.5,
-            "current_generation_kw": 340.0,
-            "daily_energy_mwh": 4.8,
-            "performance_ratio_percent": 99.5,
-            "status": "Operational",
-            "last_updated": "Just now"
-        }
-    ]
-
-    total_mw = sum(p["capacity_mw"] for p in plants)
-    total_mwh = sum(p["daily_energy_mwh"] for p in plants)
-    avg_pr = round(sum(p["performance_ratio_percent"] for p in plants) / len(plants), 1)
-
     return jsonify({
         "success": True,
-        "total_managed_capacity_mw": total_mw,
-        "today_total_generation_mwh": round(total_mwh, 1),
-        "active_plants_count": len(plants),
-        "average_performance_ratio": avg_pr,
-        "total_co2_offset_tons": round(total_mwh * 0.82, 1),
-        "plants": plants
-    })
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "totalManagedCapacityMw": 455.0,
+        "todayTotalGenerationMwh": 2180.4,
+        "averagePerformanceRatio": 82.4,
+        "totalCo2OffsetTons": 820000,
+        "activePlants": [
+            {
+                "id": "plt_kutch_wind",
+                "name": "Gujarat Kutch Wind Farm (120 MW)",
+                "category": "Wind",
+                "currentOutputMw": 98.4,
+                "windSpeedMs": 9.2,
+                "availability": 98.9,
+                "status": "Optimal"
+            },
+            {
+                "id": "plt_bhadla_solar",
+                "name": "Rajasthan Bhadla Solar Park (250 MW)",
+                "category": "Solar",
+                "currentOutputMw": 214.6,
+                "solarIrradianceWm2": 880,
+                "performanceRatio": 83.1,
+                "status": "Optimal"
+            },
+            {
+                "id": "plt_charanka_hybrid",
+                "name": "Patan Hybrid Wind-Solar Park (75 MW)",
+                "category": "Hybrid",
+                "currentOutputMw": 58.2,
+                "batteryStateOfCharge": 92.0,
+                "status": "Optimal"
+            },
+            {
+                "id": "plt_expressway_ev",
+                "name": "Delhi-Mumbai Highway EV Plazas",
+                "category": "EV Charging",
+                "activeChargingGuns": 18,
+                "currentPowerDrawKw": 1420,
+                "status": "Online"
+            }
+        ]
+    }), 200
 
 # ---------------------------------------------------------------------------
-# Technical Consultation / Audit Booking (Android Feature)
+# 9. Technical Site Audits & Consultations
 # ---------------------------------------------------------------------------
-@app.route("/api/consultation/schedule", methods=["POST"])
 @app.route("/api/v1/consultation/schedule", methods=["POST"])
 def schedule_consultation():
-    data = request.get_json(silent=True) or {}
-    name = str(data.get("name", "")).strip()
-    organization = str(data.get("organization", "")).strip()
-    email = str(data.get("email", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    preferred_date = str(data.get("preferred_date") or data.get("preferredDate") or "").strip()
-    topic = str(data.get("topic", "General Renewable Audit")).strip()
+    data = get_request_data()
+    full_name = data.get("fullName", "").strip()
+    email = data.get("email", "").strip().lower()
+    phone = data.get("phone", "").strip()
+    organization = data.get("organization", "").strip()
+    preferred_date = data.get("preferredDate", "")
+    audit_topic = data.get("auditTopic", "Comprehensive Renewable Energy Audit")
+    site_location = data.get("siteLocation", "")
 
-    if not name or not email or not phone:
-        return rfc9457_error(title="Missing Contact Info", detail="Name, email, and phone number are required.", status=422)
+    if not full_name or not email or not phone:
+        return rfc9457_error("Unprocessable Entity", 422, "Full name, email, and phone number are required to schedule an engineering audit.")
 
-    booking_id = f"AUD-{uuid.uuid4().hex[:6].upper()}"
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    consultation_id = f"cns_{uuid.uuid4().hex[:10]}"
+    booking_ref = f"AUD-{uuid.uuid4().hex[:6].upper()}"
 
     db.execute_write(
         """
-        INSERT INTO consultations (id, name, organization, email, phone, preferred_date, topic, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO consultations (id, booking_reference, full_name, email, phone, organization, preferred_date, audit_topic, site_location, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'SCHEDULED')
         """,
-        (booking_id, name, organization, email, phone, preferred_date, topic, now_iso)
+        (consultation_id, booking_ref, full_name, email, phone, organization, preferred_date, audit_topic, site_location)
     )
+
+    # Email notification to admin team
+    email_service.send_consultation_alert({
+        "booking_reference": booking_ref,
+        "full_name": full_name,
+        "email": email,
+        "phone": phone,
+        "organization": organization,
+        "preferred_date": preferred_date,
+        "audit_topic": audit_topic,
+        "site_location": site_location
+    })
 
     return jsonify({
         "success": True,
-        "booking_reference": booking_id,
-        "message": f"Site Technical Consultation scheduled for {preferred_date or 'upcoming schedule'}. Reference ID: {booking_id}. Our lead renewable engineer will reach out to confirm coordinates.",
-        "scheduledAt": now_iso
+        "consultationId": consultation_id,
+        "bookingReference": booking_ref,
+        "status": "SCHEDULED",
+        "message": f"Site audit consultation booked successfully with reference {booking_ref}.",
+        "leadEngineer": "Dinesh Ahirwar (+91 63756 96762)"
     }), 201
 
 # ---------------------------------------------------------------------------
-# RFQ / Quotation Requests (Blueprint Section 7 & Android Feature)
+# 10. RFQ Quotes & Commercial Proposals
 # ---------------------------------------------------------------------------
-@app.route("/api/rfq", methods=["POST"])
 @app.route("/api/v1/quotes", methods=["POST"])
-def submit_rfq():
-    data = request.get_json(silent=True) or {}
-    company = str(data.get("company_name") or data.get("companyName") or "").strip()
-    contact = str(data.get("contact_person") or data.get("contactPerson") or "").strip()
-    email = str(data.get("email", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    service_type = str(data.get("service_type") or data.get("serviceType") or "Solar").strip()
-    capacity = str(data.get("capacity_mw") or data.get("capacityMw") or "").strip()
-    location = str(data.get("location", "")).strip()
-    details = str(data.get("project_details") or data.get("projectDetails") or "").strip()
+def request_quote():
+    data = get_request_data()
+    customer_name = data.get("customerName", "").strip()
+    email = data.get("email", "").strip().lower()
+    phone = data.get("phone", "").strip()
+    company = data.get("company", "").strip()
+    project_type = data.get("projectType", "Solar Power Plant")
+    capacity = data.get("capacity", "100 kW")
 
-    if not contact or not email or not phone:
-        return rfc9457_error(title="Incomplete RFQ", detail="Contact person, email and phone are mandatory for RFQ generation.", status=422)
+    if not customer_name or not email or not phone:
+        return rfc9457_error("Unprocessable Entity", 422, "Customer name, email, and phone number are required for quotation generation.")
 
-    rfq_id = f"RFQ-{uuid.uuid4().hex[:8].upper()}"
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    quote_id = f"qt_{uuid.uuid4().hex[:10]}"
+    quote_number = f"NPQ-{datetime.datetime.now().year}-{uuid.uuid4().hex[:6].upper()}"
+
+    # Auto engineering budget estimate
+    cap_val = 100.0
+    try:
+        cap_val = float(re.findall(r"\d+", capacity)[0])
+    except Exception:
+        pass
+
+    rate_per_kw = 52000.0 if "solar" in project_type.lower() else (68000.0 if "wind" in project_type.lower() else 75000.0)
+    est_total = cap_val * rate_per_kw
+
+    breakdown = {
+        "equipmentCostInr": round(est_total * 0.65, 2),
+        "civilAndStructuralInr": round(est_total * 0.15, 2),
+        "electricalBosInr": round(est_total * 0.12, 2),
+        "statutoryPermitsAndDiscomLiaisonInr": round(est_total * 0.04, 2),
+        "testingAndCommissioningInr": round(est_total * 0.04, 2),
+        "totalEstimateInr": est_total
+    }
 
     db.execute_write(
         """
-        INSERT INTO quotes (id, client_name, service_type, capacity, status, notes, created_at)
-        VALUES (?, ?, ?, ?, 'SUBMITTED', ?, ?)
+        INSERT INTO quotes (id, quote_number, customer_name, email, phone, company, project_type, capacity, estimated_amount_inr, breakdown_json, validity_days, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 30, 'SUBMITTED')
         """,
-        (rfq_id, f"{contact} ({company})", service_type, capacity, f"Location: {location}. Details: {details}", now_iso)
+        (quote_id, quote_number, customer_name, email, phone, company, project_type, capacity, est_total, json.dumps(breakdown))
     )
 
     return jsonify({
         "success": True,
-        "rfq_ticket_id": rfq_id,
-        "quoteId": rfq_id,
+        "quoteId": quote_id,
+        "quoteNumber": quote_number,
+        "projectType": project_type,
+        "capacity": capacity,
+        "estimatedAmountInr": est_total,
+        "breakdown": breakdown,
+        "validityDays": 30,
         "status": "SUBMITTED",
-        "message": f"Your EPC quotation request for {service_type} ({capacity}) has been logged successfully. Reference ID: {rfq_id}.",
-        "createdAt": now_iso
+        "message": f"Commercial quote proposal {quote_number} generated. A technical advisor will contact you to finalize terms."
     }), 201
 
 @app.route("/api/v1/quotes/<quote_id>", methods=["GET"])
 def get_quote_detail(quote_id):
-    quote = db.execute_read_one("SELECT * FROM quotes WHERE id = ?", (quote_id,))
-    if not quote:
-        return rfc9457_error(title="Quote Not Found", detail=f"No quote found with ID {quote_id}", status=404)
-    return jsonify({"success": True, "quote": quote})
+    row = db.execute_read_one("SELECT * FROM quotes WHERE id = ? OR quote_number = ?", (quote_id, quote_id))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Quotation '{quote_id}' not found.")
+    q = dict(row)
+    if isinstance(q.get("breakdown_json"), str):
+        try:
+            q["breakdown"] = json.loads(q["breakdown_json"])
+        except Exception:
+            q["breakdown"] = {}
+    elif isinstance(q.get("breakdown_json"), dict):
+        q["breakdown"] = q["breakdown_json"]
+    q.pop("breakdown_json", None)
+    return jsonify({"success": True, "quote": q}), 200
 
 @app.route("/api/v1/quotes/<quote_id>/accept", methods=["POST"])
 def accept_quote(quote_id):
-    quote = db.execute_read_one("SELECT * FROM quotes WHERE id = ?", (quote_id,))
-    if not quote:
-        return rfc9457_error(title="Quote Not Found", detail=f"No quote found with ID {quote_id}", status=404)
-
-    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
-    db.execute_write("UPDATE quotes SET status = 'ACCEPTED' WHERE id = ?", (quote_id,))
+    row = db.execute_read_one("SELECT * FROM quotes WHERE id = ? OR quote_number = ?", (quote_id, quote_id))
+    if not row:
+        return rfc9457_error("Not Found", 404, f"Quotation '{quote_id}' not found.")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.execute_write("UPDATE quotes SET status = 'ACCEPTED', accepted_at = ? WHERE id = ?", (now_iso, row["id"]))
     return jsonify({
         "success": True,
-        "quoteId": quote_id,
+        "quoteId": row["id"],
+        "quoteNumber": row["quote_number"],
         "status": "ACCEPTED",
-        "message": "Quote accepted. Our project delivery team will initiate onboarding.",
-        "acceptedAt": now_iso
-    })
+        "message": "Quotation accepted. The project has moved to detailed EPC engineering contract review."
+    }), 200
 
 # ---------------------------------------------------------------------------
-# Authentication (Blueprint Section 7)
-# ---------------------------------------------------------------------------
-@app.route("/api/v1/auth/login", methods=["POST"])
-def auth_login():
-    data = request.get_json(silent=True) or {}
-    username = str(data.get("username") or data.get("email") or "").strip()
-    password = str(data.get("password") or "").strip()
-
-    if not username or not password:
-        return rfc9457_error(title="Missing Credentials", detail="Email/username and password required.", status=400)
-
-    # Standard demo / enterprise login validation
-    token = f"neo_jwt_{uuid.uuid4().hex}"
-    role = "ADMIN" if "admin" in username.lower() else "STAFF"
-    return jsonify({
-        "success": True,
-        "token": token,
-        "tokenType": "Bearer",
-        "expiresIn": 86400,
-        "user": {
-            "id": "usr_01",
-            "name": username.split("@")[0].capitalize(),
-            "email": username,
-            "role": role,
-            "permissions": ["leads:read", "leads:write", "projects:read", "quotes:read"]
-        }
-    })
-
-@app.route("/api/v1/auth/me", methods=["GET"])
-def auth_me():
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return rfc9457_error(title="Unauthorized", detail="Missing or invalid Bearer token.", status=401)
-    return jsonify({
-        "success": True,
-        "user": {
-            "id": "usr_01",
-            "name": "Neoserve Staff",
-            "role": "STAFF",
-            "status": "ACTIVE"
-        }
-    })
-
-# ---------------------------------------------------------------------------
-# Global Error Handlers (RFC 9457 compliant)
+# Global 404 & 500 Error Handlers (RFC 9457)
 # ---------------------------------------------------------------------------
 @app.errorhandler(404)
 def not_found_handler(e):
-    return rfc9457_error(title="Resource Not Found", detail="The requested URL was not found on this server.", status=404)
-
-@app.errorhandler(405)
-def method_not_allowed_handler(e):
-    return rfc9457_error(title="Method Not Allowed", detail="The HTTP method is not allowed for this endpoint.", status=405)
+    return rfc9457_error("Not Found", 404, "The requested resource or endpoint does not exist.")
 
 @app.errorhandler(500)
 def internal_error_handler(e):
-    return rfc9457_error(title="Internal Server Error", detail="An unexpected error occurred. Please contact support.", status=500)
+    return rfc9457_error("Internal Server Error", 500, "An unexpected server error occurred. Please try again.")
 
 # ---------------------------------------------------------------------------
-# Application Entry Point
+# Server Launch
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"Starting Neoserve Projects API on port {port}...")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    debug_mode = os.environ.get("FLASK_ENV", "development") == "development"
+    print(f"============================================================")
+    print(f"⚡ Neoserve Enterprise API Engine v2.1.0")
+    print(f"⚡ Database Mode: {db.mode.upper()}")
+    print(f"⚡ SMTP Mail Service: {'CONFIGURED' if email_service.is_configured() else 'SIMULATED (Logs locally)'}")
+    print(f"⚡ Brochure Download: {'ENABLED' if os.path.exists(BROCHURE_PDF_PATH) else 'NOT FOUND'}")
+    print(f"⚡ Server Listening on http://0.0.0.0:{port}")
+    print(f"============================================================")
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
