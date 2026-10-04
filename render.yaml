@@ -1,12 +1,12 @@
 services:
   - type: web
-    name: neoserve-api
+    name: rms-monster-api
     runtime: python
     plan: free
     region: oregon
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
-    healthCheckPath: /api/v1/health
+    healthCheckPath: /api/health
     envVars:
       - key: FLASK_ENV
         value: production

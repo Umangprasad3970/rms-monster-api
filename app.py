@@ -23,7 +23,7 @@ CORS(
         r"/*": {
             "origins": "*",
             "methods": ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Request-Id", "Idempotency-Key", "Accept"]
+            "allow_headers": ["Content-Type", "Authorization", "X-Request-Id", "Idempotency-Key", "Accept", "X-Admin-Key", "Origin"]
         }
     }
 )
@@ -1054,6 +1054,17 @@ def handle_after_request(response):
     response.headers["X-Request-Id"] = getattr(g, "request_id", "")
     return response
 
+@app.route("/", methods=["GET"])
+def root_index():
+    return jsonify({
+        "success": True,
+        "message": "RMS Monster API is running",
+        "service": "Neoserve Enterprise Clean Energy API",
+        "version": "2.1.0",
+        "status": "HEALTHY",
+        "databaseEngine": db.mode
+    }), 200
+
 # ---------------------------------------------------------------------------
 # 1. Health & Readiness Endpoints
 # ---------------------------------------------------------------------------
@@ -1061,6 +1072,8 @@ def handle_after_request(response):
 @app.route("/api/v1/health", methods=["GET"])
 def health_check():
     return jsonify({
+        "success": True,
+        "message": "API and database are connected",
         "status": "HEALTHY",
         "service": "Neoserve Enterprise Clean Energy API",
         "version": "2.1.0",
@@ -1307,17 +1320,17 @@ def submit_lead():
             }), 201
 
     # Extract fields with support for both v1 and legacy names
-    full_name = data.get("fullName") or data.get("name") or ""
+    full_name = data.get("fullName") or data.get("name") or data.get("full_name") or ""
     email = data.get("email") or ""
     phone = data.get("phone") or ""
     company = data.get("company") or ""
-    service_id = data.get("serviceId") or ""
-    project_type = data.get("projectType") or data.get("project_type") or "Clean Energy EPC"
+    service_id = data.get("serviceId") or data.get("service_id") or data.get("service") or ""
+    project_type = data.get("projectType") or data.get("project_type") or data.get("service") or "Clean Energy EPC"
     location = data.get("location") or ""
     capacity = data.get("capacity") or ""
     timeline = data.get("timeline") or ""
     budget_range = data.get("budgetRange") or data.get("budget_range") or ""
-    message = data.get("message") or ""
+    message = data.get("message") or data.get("comments") or data.get("requirement") or "Clean energy project requirement enquiry."
     source = data.get("source") or ("android_app" if "android" in request.headers.get("User-Agent", "").lower() else "website")
     campaign = data.get("campaign") or ""
 
@@ -1325,12 +1338,10 @@ def submit_lead():
     errors = []
     if not full_name or len(full_name.strip()) < 2:
         errors.append({"field": "fullName", "code": "invalid_length", "message": "Full name must be at least 2 characters."})
-    if not email or "@" not in email or "." not in email:
+    if not email or "@" not in email:
         errors.append({"field": "email", "code": "invalid_format", "message": "A valid email address is required."})
     if not phone or len(phone.strip()) < 7:
         errors.append({"field": "phone", "code": "invalid_length", "message": "A valid contact phone number is required."})
-    if not message or len(message.strip()) < 5:
-        errors.append({"field": "message", "code": "invalid_length", "message": "Please describe your project requirements in at least 5 characters."})
 
     if errors:
         return rfc9457_error("Unprocessable Entity", 422, "Please correct the highlighted form errors.", invalid_params=errors)
@@ -1398,11 +1409,13 @@ def submit_lead():
 
     return jsonify({
         "success": True,
+        "contact_id": contact_id or 1,
+        "contactId": contact_id or 1,
         "leadId": lead_id,
         "status": "NEW",
-        "contactId": contact_id,
-        "message": "Your project requirement has been submitted successfully to Neoserve Projects.",
+        "message": "Your enquiry has been submitted successfully",
         "nextStep": "Our technical engineering team led by Dinesh Ahirwar will review your requirements and reach out within 24 hours.",
+        "created_at": now_iso,
         "createdAt": now_iso
     }), 201
 
@@ -1661,15 +1674,17 @@ def get_telemetry_overview():
 # 9. Technical Site Audits & Consultations
 # ---------------------------------------------------------------------------
 @app.route("/api/v1/consultation/schedule", methods=["POST"])
+@app.route("/api/consultations", methods=["POST"])
+@app.route("/api/consultation", methods=["POST"])
 def schedule_consultation():
     data = get_request_data()
-    full_name = data.get("fullName", "").strip()
+    full_name = (data.get("fullName") or data.get("name") or "").strip()
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
-    organization = data.get("organization", "").strip()
-    preferred_date = data.get("preferredDate", "")
-    audit_topic = data.get("auditTopic", "Comprehensive Renewable Energy Audit")
-    site_location = data.get("siteLocation", "")
+    organization = (data.get("organization") or data.get("org") or data.get("company") or "").strip()
+    preferred_date = data.get("preferredDate") or data.get("preferred_date") or ""
+    audit_topic = data.get("auditTopic") or data.get("topic") or "Comprehensive Renewable Energy Audit"
+    site_location = data.get("siteLocation") or data.get("location") or ""
 
     if not full_name or not email or not phone:
         return rfc9457_error("Unprocessable Entity", 422, "Full name, email, and phone number are required to schedule an engineering audit.")
@@ -1710,14 +1725,16 @@ def schedule_consultation():
 # 10. RFQ Quotes & Commercial Proposals
 # ---------------------------------------------------------------------------
 @app.route("/api/v1/quotes", methods=["POST"])
+@app.route("/api/quotes", methods=["POST"])
+@app.route("/api/quote", methods=["POST"])
 def request_quote():
     data = get_request_data()
-    customer_name = data.get("customerName", "").strip()
+    customer_name = (data.get("customerName") or data.get("contact_person") or data.get("name") or "Prospective Client").strip()
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
-    company = data.get("company", "").strip()
-    project_type = data.get("projectType", "Solar Power Plant")
-    capacity = data.get("capacity", "100 kW")
+    company = (data.get("company") or data.get("company_name") or "").strip()
+    project_type = data.get("projectType") or data.get("service_type") or data.get("service") or "Solar Power Plant"
+    capacity = data.get("capacity") or data.get("capacity_mw") or "100 kW"
 
     if not customer_name or not email or not phone:
         return rfc9457_error("Unprocessable Entity", 422, "Customer name, email, and phone number are required for quotation generation.")
