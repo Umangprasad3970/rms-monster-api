@@ -70,9 +70,9 @@ print(f"Carbon Offset: {c_res.get('carbonOffsetTonsPerYear')} Tons CO2 / year")
 # 8. Lead Submission with Asynchronous Email Notification
 print("\n[8] Lead Submission (/api/v1/leads):")
 lead_payload = {
-    "fullName": "Dinesh Ahirwar Commercial Lead",
-    "email": "dinesh.ahirwar@neoservepro.com",
-    "phone": "+91 63756 96762",
+    "fullName": "Ujjwal Prasad Commercial Lead",
+    "email": "umangprasad3970@gmail.com",
+    "phone": "+91 82109 67599",
     "company": "Gujarat State Energy Development Corp",
     "serviceId": "wind-power-projects",
     "projectType": "Wind Power Plant",
@@ -122,7 +122,72 @@ print(f"Quote Number: {q_data.get('quoteNumber')}")
 print(f"Estimated Amount: Rs. {q_data.get('estimatedAmountInr'):,.2f}")
 print(f"Breakdown: {q_data.get('breakdown')}")
 
+# 11. Enterprise Security Status
+print("\n[11] Enterprise Security Status (/api/v1/security/status):")
+sec_status = client.get("/api/v1/security/status")
+print(f"Status: {sec_status.status_code}")
+s_info = sec_status.get_json()
+print(f"Algorithm: {s_info.get('algorithm')}")
+print(f"Key ID: {s_info.get('keyId')}")
+print(f"Key Fingerprint: {s_info.get('keyFingerprint')}")
+assert s_info.get("algorithm") == "AES-256-CBC"
+assert s_info.get("encryptionEnabled") is True
+
+# 12. End-to-End Encrypted Request and Response Payload
+print("\n[12] End-to-End AES-256 Encrypted Payload Lead Submission (/api/v1/leads):")
+raw_lead = {
+    "fullName": "Ujjwal Prasad Secure Client",
+    "email": "umangprasad3970@gmail.com",
+    "phone": "+91 82109 67599",
+    "company": "Gujarat Clean Energy Corridor",
+    "projectType": "Solar-Wind Hybrid with BESS",
+    "capacity": "150 MW",
+    "location": "Banaskantha, Gujarat",
+    "message": "Confidential enquiry sent over AES-256 encrypted payload channel.",
+    "source": "encrypted-mobile-client"
+}
+# Encrypt request payload client-side using enterprise key
+encrypted_req = app.crypto_service.encrypt(raw_lead)
+print(f"Client encrypted ciphertext (IV: {encrypted_req.get('iv')[:10]}...): {encrypted_req.get('data')[:30]}...")
+
+# Submit encrypted payload to server with X-Payload-Encrypted and X-Client-Encryption headers
+enc_res = client.post(
+    "/api/v1/leads",
+    json=encrypted_req,
+    headers={
+        "X-Payload-Encrypted": "true",
+        "X-Client-Encryption": "true"
+    }
+)
+print(f"Response Status: {enc_res.status_code}")
+print(f"Response Header X-Payload-Encrypted: {enc_res.headers.get('X-Payload-Encrypted')}")
+
+# Response was returned encrypted by the server
+enc_json = enc_res.get_json()
+assert enc_json.get("encrypted") is True
+print(f"Server encrypted response data: {enc_json.get('data')[:30]}...")
+
+# Client decrypts response
+decrypted_res = app.crypto_service.decrypt(enc_json)
+print(f"Decrypted Response: {decrypted_res}")
+assert decrypted_res.get("success") is True
+assert "leadId" in decrypted_res
+print(f"Secure Lead Created Successfully: ID = {decrypted_res.get('leadId')}")
+
+# 13. Security Encrypt / Decrypt Utility Verification
+print("\n[13] Security Utility Endpoints (/api/v1/security/encrypt & /decrypt):")
+test_obj = {"confidentialAuditNotes": "Feasibility verified for 150MW. Approved by Ujjwal Prasad."}
+enc_util = client.post("/api/v1/security/encrypt", json={"payload": test_obj})
+assert enc_util.status_code == 200
+enc_body = enc_util.get_json().get("encryptedPayload")
+
+dec_util = client.post("/api/v1/security/decrypt", json={"encryptedPayload": enc_body})
+assert dec_util.status_code == 200
+assert dec_util.get_json().get("decryptedData") == test_obj
+print("Security utility encrypt and decrypt roundtrip verified successfully!")
+
 time.sleep(1)
 print("\n==================================================")
-print("ALL 10 API TEST SUITES EXECUTED WITH ZERO ERRORS!")
+print("ALL 13 API & ENCRYPTION TEST SUITES PASSED (100%)!")
 print("==================================================")
+

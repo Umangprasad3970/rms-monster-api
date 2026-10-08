@@ -13,10 +13,10 @@ Built according to the **Neoserve API Architecture Blueprint** and grounded dire
   2. **PostgreSQL Compatible:** Direct connection support via `DATABASE_URL` (e.g. Supabase, Render Postgres, AWS RDS).
   3. **Local SQLite Fallback:** Seamless local failover (`neoserve.db`) if cloud DB is temporarily offline, ensuring 100% uptime.
 - **Asynchronous SMTP Email Notifications:** Automatic background dispatch of:
-  - Executive lead alerts to Neoserve team (`info@neoservepro.com`).
+  - Executive lead alerts to Neoserve team (`umangprasad3970@gmail.com`).
   - Branded client acknowledgement emails with 24-hr review SLA.
 - **Official Brochure Integration:**
-  - Company leadership: Dinesh Ahirwar (`+91 63756 96762`, `info@neoservepro.com`).
+  - Company leadership: Ujjwal Prasad (`+91 82109 67599`, `umangprasad3970@gmail.com`).
   - Direct brochure PDF download endpoint (`/api/v1/brochure/download`).
 - **Standardized RFC 9457 Problem Details:** Detailed error reporting with correlation request IDs (`X-Request-Id`).
 - **Idempotency Protection:** Prevents duplicate lead creation on network retries via `Idempotency-Key` headers.
@@ -65,10 +65,10 @@ Under the **Environment Variables** section on Render, add the following key-val
 | `MYSQL_DATABASE` | `neoserve_db` | MySQL database name |
 | `SMTP_HOST` | `smtp.gmail.com` | SMTP host (e.g. Gmail, Zoho, SendGrid) |
 | `SMTP_PORT` | `587` | SMTP port (587 TLS or 465 SSL) |
-| `SMTP_USER` | `info@neoservepro.com` | Email account username |
+| `SMTP_USER` | `umangprasad3970@gmail.com` | Email account username |
 | `SMTP_PASSWORD` | `your_app_password` | Email / Google App password |
-| `SMTP_FROM_EMAIL` | `info@neoservepro.com` | Sender email address |
-| `NOTIFICATION_EMAIL_TO` | `info@neoservepro.com` | Recipient for new lead notifications |
+| `SMTP_FROM_EMAIL` | `umangprasad3970@gmail.com` | Sender email address |
+| `NOTIFICATION_EMAIL_TO` | `umangprasad3970@gmail.com` | Recipient for new lead notifications |
 
 *(Note: If you don't configure MySQL or SMTP initially, the API will still run with local SQLite and simulated mail logs!)*
 
@@ -89,7 +89,7 @@ https://neoserve-api.onrender.com
 
 ### 1. Health & Company Identity
 - `GET /api/v1/health` (Legacy: `GET /api/health`): Service status, DB engine, uptime timestamp.
-- `GET /api/v1/company/overview`: Mission, national 500 GW target, Dinesh Ahirwar leadership info.
+- `GET /api/v1/company/overview`: Mission, national 500 GW target, Ujjwal Prasad leadership info.
 - `GET /api/v1/company/stats`: High-level stats (455 MW managed, 890.5 GWh generation, 820k tons CO2 offset).
 - `GET /api/v1/brochure/info`: Brochure metadata, page count, and download link.
 - `GET /api/v1/brochure/download`: Direct download of official 6.58 MB PDF brochure.

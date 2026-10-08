@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import base64
+import hashlib
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+
 app = Flask(__name__)
 
 # Allow CORS for web, local dev, emulator, and mobile apps
@@ -23,7 +28,14 @@ CORS(
         r"/*": {
             "origins": "*",
             "methods": ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Request-Id", "Idempotency-Key", "Accept", "X-Admin-Key", "Origin"]
+            "allow_headers": [
+                "Content-Type", "Authorization", "X-Request-Id", "Idempotency-Key", 
+                "Accept", "X-Admin-Key", "Origin", "X-Payload-Encrypted", 
+                "X-Client-Encryption", "X-Encryption-Key-Id", "X-Encryption-Key-Fingerprint"
+            ],
+            "expose_headers": [
+                "X-Request-Id", "X-Payload-Encrypted", "X-Encryption-Key-Fingerprint", "X-Encryption-Key-Id"
+            ]
         }
     }
 )
@@ -275,7 +287,7 @@ class DatabaseManager:
                         message TEXT NOT NULL,
                         status VARCHAR(50) DEFAULT 'NEW',
                         score INT DEFAULT 50,
-                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        owner_id VARCHAR(100) DEFAULT 'ujjwal.prasad',
                         source VARCHAR(100) DEFAULT 'website',
                         campaign VARCHAR(150) DEFAULT NULL,
                         idempotency_key VARCHAR(150) DEFAULT NULL,
@@ -306,7 +318,7 @@ class DatabaseManager:
                         message TEXT NOT NULL,
                         status VARCHAR(50) DEFAULT 'NEW',
                         score INT DEFAULT 50,
-                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        owner_id VARCHAR(100) DEFAULT 'ujjwal.prasad',
                         source VARCHAR(100) DEFAULT 'website',
                         campaign VARCHAR(150),
                         idempotency_key VARCHAR(150),
@@ -331,7 +343,7 @@ class DatabaseManager:
                         message TEXT NOT NULL,
                         status TEXT DEFAULT 'NEW',
                         score INTEGER DEFAULT 50,
-                        owner_id TEXT DEFAULT 'dinesh.ahirwar',
+                        owner_id TEXT DEFAULT 'ujjwal.prasad',
                         source TEXT DEFAULT 'website',
                         campaign TEXT,
                         idempotency_key TEXT,
@@ -350,7 +362,7 @@ class DatabaseManager:
                         subject VARCHAR(255) NOT NULL,
                         notes TEXT DEFAULT NULL,
                         outcome VARCHAR(100) DEFAULT NULL,
-                        created_by VARCHAR(100) DEFAULT 'Dinesh Ahirwar',
+                        created_by VARCHAR(100) DEFAULT 'Ujjwal Prasad',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         INDEX idx_activities_lead (lead_id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -364,7 +376,7 @@ class DatabaseManager:
                         subject TEXT NOT NULL,
                         notes TEXT,
                         outcome TEXT,
-                        created_by TEXT DEFAULT 'Dinesh Ahirwar',
+                        created_by TEXT DEFAULT 'Ujjwal Prasad',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -377,7 +389,7 @@ class DatabaseManager:
                         entity_type VARCHAR(50) NOT NULL DEFAULT 'LEAD',
                         entity_id VARCHAR(64) NOT NULL,
                         title VARCHAR(255) NOT NULL,
-                        owner_id VARCHAR(100) DEFAULT 'dinesh.ahirwar',
+                        owner_id VARCHAR(100) DEFAULT 'ujjwal.prasad',
                         due_at VARCHAR(100) DEFAULT NULL,
                         priority VARCHAR(50) DEFAULT 'MEDIUM',
                         status VARCHAR(50) DEFAULT 'PENDING',
@@ -394,7 +406,7 @@ class DatabaseManager:
                         entity_type TEXT NOT NULL DEFAULT 'LEAD',
                         entity_id TEXT NOT NULL,
                         title TEXT NOT NULL,
-                        owner_id TEXT DEFAULT 'dinesh.ahirwar',
+                        owner_id TEXT DEFAULT 'ujjwal.prasad',
                         due_at TEXT,
                         priority TEXT DEFAULT 'MEDIUM',
                         status TEXT DEFAULT 'PENDING',
@@ -836,8 +848,8 @@ class EmailService:
         self.smtp_port = int(os.environ.get("SMTP_PORT", "587"))
         self.smtp_user = os.environ.get("SMTP_USER", "")
         self.smtp_password = os.environ.get("SMTP_PASSWORD", "")
-        self.smtp_from = os.environ.get("SMTP_FROM_EMAIL", "info@neoservepro.com")
-        self.notification_to = os.environ.get("NOTIFICATION_EMAIL_TO", "info@neoservepro.com")
+        self.smtp_from = os.environ.get("SMTP_FROM_EMAIL", "umangprasad3970@gmail.com")
+        self.notification_to = os.environ.get("NOTIFICATION_EMAIL_TO", "umangprasad3970@gmail.com")
         self.use_tls = os.environ.get("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes")
 
     def is_configured(self):
@@ -951,7 +963,7 @@ class EmailService:
                     </div>
                 </div>
                 <div class="footer">
-                    Neoserve Projects &bull; Empowering Sustainable Growth &bull; Contact: Dinesh Ahirwar (+91 63756 96762)
+                    Neoserve Projects &bull; Empowering Sustainable Growth &bull; Contact: Ujjwal Prasad (+91 82109 67599)
                 </div>
             </div>
         </body>
@@ -990,9 +1002,9 @@ class EmailService:
                             <p style="margin:0 0 5px 0;"><strong>Project Type:</strong> {lead_data.get('projectType')}</p>
                             <p style="margin:0;"><strong>Review Status:</strong> Scheduled for Engineering Review (within 24 hours)</p>
                         </div>
-                        <p>Our senior technical consultant led by <strong>Dinesh Ahirwar</strong> will review your location and capacity parameters and connect with you to discuss site feasibility, yield forecasts, and turnkey execution.</p>
+                        <p>Our senior technical consultant led by <strong>Ujjwal Prasad</strong> will review your location and capacity parameters and connect with you to discuss site feasibility, yield forecasts, and turnkey execution.</p>
                         <p>For urgent engineering consultations or site surveys, reach out directly:</p>
-                        <p><strong>Phone:</strong> +91 63756 96762<br/><strong>Email:</strong> info@neoservepro.com<br/><strong>Website:</strong> www.neoservepro.com</p>
+                        <p><strong>Phone:</strong> +91 82109 67599<br/><strong>Email:</strong> umangprasad3970@gmail.com<br/><strong>Website:</strong> rms.monster</p>
                     </div>
                     <div class="footer">
                         Neoserve Projects &bull; Wind Power &bull; Solar Plants &bull; PEB Structures &bull; EV Fast Charging
@@ -1025,23 +1037,108 @@ class EmailService:
 email_service = EmailService(db)
 
 # ---------------------------------------------------------------------------
+# AES-256 Enterprise Symmetric Payload Encryption System
+# ---------------------------------------------------------------------------
+class CryptoService:
+    DEFAULT_KEY_SECRET = "Neoserve_2026_Enterprise_Unique_AES256_Encryption_Key!"
+
+    def __init__(self):
+        self.secret = os.environ.get("API_ENCRYPTION_KEY", self.DEFAULT_KEY_SECRET).strip()
+        # Derive 32-byte (256-bit) AES key via SHA-256
+        self.key = hashlib.sha256(self.secret.encode("utf-8")).digest()
+        self.key_fingerprint = hashlib.sha256(self.secret.encode("utf-8")).hexdigest()[:16]
+        self.key_id = "neoserve-enterprise-2026"
+        self.algorithm = "AES-256-CBC"
+
+    def encrypt(self, data):
+        """Encrypts dictionary or string payload returning standard envelope."""
+        if isinstance(data, (dict, list)):
+            plain_text = json.dumps(data, ensure_ascii=False)
+        else:
+            plain_text = str(data)
+
+        iv = os.urandom(16)
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(plain_text.encode("utf-8")) + padder.finalize()
+
+        cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv))
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        return {
+            "encrypted": True,
+            "algorithm": self.algorithm,
+            "keyId": self.key_id,
+            "iv": base64.b64encode(iv).decode("utf-8"),
+            "data": base64.b64encode(ciphertext).decode("utf-8")
+        }
+
+    def decrypt(self, payload):
+        """Decrypts standard envelope back to plaintext string or parsed JSON."""
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                raise ValueError("Encrypted payload must be a JSON envelope")
+
+        if not isinstance(payload, dict) or "iv" not in payload or "data" not in payload:
+            raise ValueError("Payload missing required 'iv' or 'data' fields")
+
+        iv = base64.b64decode(payload["iv"])
+        ciphertext = base64.b64decode(payload["data"])
+
+        cipher = Cipher(algorithms.AES(self.key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+
+        unpadder = padding.PKCS7(128).unpadder()
+        plain_bytes = unpadder.update(padded_data) + unpadder.finalize()
+        plain_text = plain_bytes.decode("utf-8")
+
+        try:
+            return json.loads(plain_text)
+        except Exception:
+            return plain_text
+
+crypto_service = CryptoService()
+
+# ---------------------------------------------------------------------------
 # Request Utilities & RFC 9457 Problem Details
 # ---------------------------------------------------------------------------
 def get_request_data():
-    """Seamlessly extracts payload from JSON or standard URL-encoded web forms."""
+    """Seamlessly extracts and decrypts payload from JSON, encrypted envelope, or form."""
+    if hasattr(g, "decrypted_data") and g.decrypted_data is not None:
+        return g.decrypted_data
+
+    raw_data = None
     if request.is_json:
-        return request.get_json(silent=True) or {}
-    if request.form:
-        return request.form.to_dict()
-    # Try parsing raw data as JSON fallback
-    try:
-        return json.loads(request.get_data(as_text=True))
-    except Exception:
-        return {}
+        raw_data = request.get_json(silent=True) or {}
+    elif request.form:
+        raw_data = request.form.to_dict()
+    else:
+        try:
+            raw_text = request.get_data(as_text=True)
+            if raw_text:
+                raw_data = json.loads(raw_text)
+        except Exception:
+            raw_data = {}
+
+    if isinstance(raw_data, dict) and raw_data.get("encrypted") is True and "data" in raw_data and "iv" in raw_data:
+        try:
+            decrypted = crypto_service.decrypt(raw_data)
+            g.decrypted_data = decrypted
+            g.is_payload_encrypted = True
+            return decrypted
+        except Exception as e:
+            print(f"[CryptoService] Decryption failed: {e}")
+            return raw_data
+
+    g.decrypted_data = raw_data if isinstance(raw_data, dict) else {}
+    return g.decrypted_data
 
 def rfc9457_error(title, status_code, detail, error_type=None, invalid_params=None):
     payload = {
-        "type": error_type or f"https://api.neoservepro.com/errors/http-{status_code}",
+        "type": error_type or f"https://rms.monster/errors/http-{status_code}",
         "title": title,
         "status": status_code,
         "detail": detail,
@@ -1055,12 +1152,43 @@ def rfc9457_error(title, status_code, detail, error_type=None, invalid_params=No
 @app.before_request
 def handle_before_request():
     g.request_id = request.headers.get("X-Request-Id") or f"req_{uuid.uuid4().hex[:12]}"
+    g.is_payload_encrypted = False
+    g.decrypted_data = None
     if request.method == "OPTIONS":
         return jsonify({"status": "OK"}), 200
+
+    # Auto-decrypt if encrypted payload is submitted
+    is_enc_header = request.headers.get("X-Payload-Encrypted", "").lower() in ("true", "1")
+    if is_enc_header or request.is_json:
+        get_request_data()
 
 @app.after_request
 def handle_after_request(response):
     response.headers["X-Request-Id"] = getattr(g, "request_id", "")
+    response.headers["X-Encryption-Key-Fingerprint"] = crypto_service.key_fingerprint
+    response.headers["X-Encryption-Algorithm"] = crypto_service.algorithm
+
+    # Encrypt outgoing JSON response if client requested it or sent encrypted payload
+    wants_encryption = (
+        request.headers.get("X-Client-Encryption", "").lower() in ("true", "1") or
+        getattr(g, "is_payload_encrypted", False)
+    )
+
+    if wants_encryption and response.content_type and "application/json" in response.content_type:
+        try:
+            raw_text = response.get_data(as_text=True)
+            try:
+                parsed = json.loads(raw_text)
+            except Exception:
+                parsed = raw_text
+
+            if not (isinstance(parsed, dict) and parsed.get("encrypted") is True):
+                encrypted_payload = crypto_service.encrypt(parsed)
+                response.set_data(json.dumps(encrypted_payload))
+                response.headers["X-Payload-Encrypted"] = "true"
+        except Exception as e:
+            print(f"[CryptoService] Response encryption error: {e}")
+
     return response
 
 @app.route("/", methods=["GET"])
@@ -1093,6 +1221,54 @@ def health_check():
     }), 200
 
 # ---------------------------------------------------------------------------
+# 1.1 Enterprise Security & Payload Cryptography Endpoints
+# ---------------------------------------------------------------------------
+@app.route("/api/v1/security/status", methods=["GET"])
+def security_status():
+    return jsonify({
+        "success": True,
+        "encryptionEnabled": True,
+        "algorithm": crypto_service.algorithm,
+        "keyId": crypto_service.key_id,
+        "keyFingerprint": crypto_service.key_fingerprint,
+        "headerRequired": "X-Payload-Encrypted",
+        "clientEncryptionHeader": "X-Client-Encryption",
+        "description": "Enterprise end-to-end payload encryption using AES-256-CBC with PKCS7 padding.",
+        "status": "OPERATIONAL"
+    }), 200
+
+@app.route("/api/v1/security/encrypt", methods=["POST"])
+def security_encrypt():
+    data = get_request_data()
+    target = data.get("payload") if (isinstance(data, dict) and "payload" in data) else data
+    encrypted = crypto_service.encrypt(target)
+    return jsonify({
+        "success": True,
+        "encryptedPayload": encrypted
+    }), 200
+
+@app.route("/api/v1/security/decrypt", methods=["POST"])
+def security_decrypt():
+    raw = None
+    if request.is_json:
+        raw = request.get_json(silent=True)
+    if not raw:
+        try:
+            raw = json.loads(request.get_data(as_text=True))
+        except Exception:
+            raw = {}
+
+    target = raw.get("encryptedPayload") if (isinstance(raw, dict) and "encryptedPayload" in raw) else raw
+    try:
+        decrypted = crypto_service.decrypt(target)
+        return jsonify({
+            "success": True,
+            "decryptedData": decrypted
+        }), 200
+    except Exception as e:
+        return rfc9457_error("Decryption Failed", 400, f"Could not decrypt payload with enterprise key: {e}")
+
+# ---------------------------------------------------------------------------
 # 2. Company Profile & Project Brochure Endpoints
 # ---------------------------------------------------------------------------
 @app.route("/api/v1/company/overview", methods=["GET"])
@@ -1114,14 +1290,14 @@ def get_company_overview():
             "Transparency"
         ],
         "leadership": {
-            "keyPerson": "Dinesh Ahirwar",
+            "keyPerson": "Ujjwal Prasad",
             "role": "Director / Operations Lead",
-            "directPhone": "+91 63756 96762",
-            "officialEmail": "info@neoservepro.com"
+            "directPhone": "+91 82109 67599",
+            "officialEmail": "umangprasad3970@gmail.com"
         },
         "headquarters": {
-            "email": "info@neoservepro.com",
-            "website": "www.neoservepro.com",
+            "email": "umangprasad3970@gmail.com",
+            "website": "rms.monster",
             "country": "India"
         }
     }), 200
@@ -1164,10 +1340,10 @@ def get_brochure_info():
             "Battery Storage (BESS) & Green Hydrogen Auxiliary Integration"
         ],
         "contact": {
-            "representative": "Dinesh Ahirwar",
-            "phone": "+91 63756 96762",
-            "email": "info@neoservepro.com",
-            "website": "www.neoservepro.com"
+            "representative": "Ujjwal Prasad",
+            "phone": "+91 82109 67599",
+            "email": "umangprasad3970@gmail.com",
+            "website": "rms.monster"
         }
     }), 200
 
@@ -1387,13 +1563,13 @@ def submit_lead():
         (full_name.strip(), email.strip().lower(), phone.strip(), company.strip(), project_type, message.strip())
     )
 
-    # 3. Create 24-hour SLA task for Dinesh Ahirwar
+    # 3. Create 24-hour SLA task for Ujjwal Prasad
     task_id = f"tsk_{uuid.uuid4().hex[:10]}"
     due_tomorrow = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
     db.execute_write(
         """
         INSERT INTO tasks (id, entity_type, entity_id, title, owner_id, due_at, priority, status)
-        VALUES (?, 'LEAD', ?, ?, 'dinesh.ahirwar', ?, 'HIGH', 'PENDING')
+        VALUES (?, 'LEAD', ?, ?, 'ujjwal.prasad', ?, 'HIGH', 'PENDING')
         """,
         (task_id, lead_id, f"Review & Qualify Lead {lead_id} - {full_name} ({project_type})", due_tomorrow)
     )
@@ -1423,7 +1599,7 @@ def submit_lead():
         "leadId": lead_id,
         "status": "NEW",
         "message": "Your enquiry has been submitted successfully",
-        "nextStep": "Our technical engineering team led by Dinesh Ahirwar will review your requirements and reach out within 24 hours.",
+        "nextStep": "Our technical engineering team led by Ujjwal Prasad will review your requirements and reach out within 24 hours.",
         "created_at": now_iso,
         "createdAt": now_iso
     }), 201
@@ -1525,7 +1701,7 @@ def update_lead(lead_id):
     # Log activity
     act_id = f"act_{uuid.uuid4().hex[:8]}"
     db.execute_write(
-        "INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, created_by) VALUES (?, ?, 'STATUS_UPDATE', ?, ?, 'Dinesh Ahirwar')",
+        "INSERT INTO lead_activities (id, lead_id, activity_type, subject, notes, created_by) VALUES (?, ?, 'STATUS_UPDATE', ?, ?, 'Ujjwal Prasad')",
         (act_id, lead_id, f"Lead updated to {status or 'updated'}", f"Score: {score}, Owner: {owner_id}")
     )
 
@@ -1542,7 +1718,7 @@ def add_lead_activity(lead_id):
     subject = data.get("subject", "Follow-up discussion")
     notes = data.get("notes", "")
     outcome = data.get("outcome", "")
-    created_by = data.get("createdBy", "Dinesh Ahirwar")
+    created_by = data.get("createdBy", "Ujjwal Prasad")
 
     act_id = f"act_{uuid.uuid4().hex[:8]}"
     db.execute_write(
@@ -1727,7 +1903,7 @@ def schedule_consultation():
         "bookingReference": booking_ref,
         "status": "SCHEDULED",
         "message": f"Site audit consultation booked successfully with reference {booking_ref}.",
-        "leadEngineer": "Dinesh Ahirwar (+91 63756 96762)"
+        "leadEngineer": "Ujjwal Prasad (+91 82109 67599)"
     }), 201
 
 # ---------------------------------------------------------------------------
